@@ -36,7 +36,7 @@ static void QYLog(NSString *fmt, ...) {
     va_end(args);
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
         [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                        dateStyle:NSDateFormatterNoDateStyle
+                                        dateStyle:NSDateFormatterNoStyle
                                         timeStyle:NSDateFormatterMediumStyle], msg];
     dispatch_async(dispatch_get_global_queue(0,0), ^{
         FILE *f = fopen(kLogFile, "a");
@@ -170,7 +170,7 @@ static QYDamageFn g_origDamage = NULL;
 static void QYDamageHook(id self, SEL _cmd, double dmg, id victim, id attacker) {
     @try {
         if ((g_god || g_kill) && victim) {
-            NSArray *enemies = objc_msgSend(self, sel_registerName("sashimiUnits"));
+            NSArray *enemies = ((id(*)(id,SEL))objc_msgSend)(self, sel_registerName("sashimiUnits"));
             BOOL isEnemy = [enemies containsObject:victim];
 
             // 一次性判定日志(验证敌我表正确性)
@@ -178,7 +178,7 @@ static void QYDamageHook(id self, SEL _cmd, double dmg, id victim, id attacker) 
                 g_dumped = YES;
                 double hp = ((double(*)(id,SEL))objc_msgSend)(victim, sel_registerName("hp"));
                 double mx = ((double(*)(id,SEL))objc_msgSend)(victim, sel_registerName("maxHp"));
-                NSString *nm = objc_msgSend(victim, sel_registerName("name"));
+                NSString *nm = ((id(*)(id,SEL))objc_msgSend)(victim, sel_registerName("name"));
                 QYLog(@"[dmg1st] cls=%@ name=%@ hp=%.0f/%.0f dmg=%.1f enemy=%d enemies=%d\nvictim=%@ attacker=%@",
                       NSStringFromClass([victim class]), nm, hp, mx, dmg, isEnemy, (int)enemies.count,
                       enemies.count ? [NSString stringWithFormat:@"%@", enemies.firstObject] : @"nil",
