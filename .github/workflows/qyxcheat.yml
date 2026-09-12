@@ -1,0 +1,25 @@
+name: QYXCheat Build
+on:
+  workflow_dispatch:
+  push:
+    paths: [ "QYXCheat.m", ".github/workflows/qyxcheat.yml" ]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile dylib
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=12.0 \
+            -fobjc-arc -fobjc-abi-version=2 -O2 \
+            -dynamiclib \
+            -framework Foundation -framework UIKit -framework CoreGraphics \
+            -o QYXCheat.dylib QYXCheat.m
+          ldid -S QYXCheat.dylib || true
+          file QYXCheat.dylib
+          md5 QYXCheat.dylib
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QYXCheat-dylib
+          path: QYXCheat.dylib
