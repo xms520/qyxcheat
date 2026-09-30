@@ -310,6 +310,8 @@ static void qy_inject_webview(WKWebView *wv) {
 
 // 保证「已经创建好配置的」WebView 也能拿到脚本：
 // hook -[WKWebView initWithFrame:configuration:]（WKWebView 本类实现，可安全交换）
+static void qy_install_userscript_on_config(WKWebViewConfiguration *cfg);   // 前置声明
+
 @interface WKWebView (QYXYHook)
 - (instancetype)qyxy_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)cfg;
 - (void)qyxy_register:(WKWebView *)self_;
