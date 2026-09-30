@@ -1,0 +1,63 @@
+name: build-qyxy-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'QYXYCheat.m'
+      - 'qyxy_js.h'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcrun --sdk iphoneos --show-sdk-path
+          clang --version | head -2
+
+      - name: Build QYXYCheat.dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=14.0 \
+            -dynamiclib \
+            -fobjc-arc \
+            -fobjc-abi-version=2 \
+            -O2 \
+            -Wno-everything \
+            -framework Foundation \
+            -framework UIKit \
+            -framework WebKit \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            -o QYXYCheat.dylib \
+            QYXYCheat.m
+          file QYXYCheat.dylib
+          ls -la QYXYCheat.dylib
+          md5 QYXYCheat.dylib 2>/dev/null || md5sum QYXYCheat.dylib
+
+      - name: Verify
+        run: |
+          vtool -show-build QYXYCheat.dylib || true
+          echo "--- undefined symbols (should be system-only, NO substrate) ---"
+          nm -u QYXYCheat.dylib | head -40
+          echo "--- dylibs used ---"
+          otool -L QYXYCheat.dylib
+
+      - name: Self-check (no CydiaSubstrate)
+        run: |
+          if otool -L QYXYCheat.dylib | grep -qi substrate; then
+            echo "ERROR: links against CydiaSubstrate"; exit 1
+          fi
+          echo "OK: no substrate dependency"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QYXYCheat-dylib
+          path: QYXYCheat.dylib
