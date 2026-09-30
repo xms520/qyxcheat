@@ -308,9 +308,15 @@ static void qy_inject_webview(WKWebView *wv) {
     });
 }
 
-// hook -[WKWebView loadRequest:] / loadHTMLString:baseURL: 等
-// 采用 method_exchangeImplementations（同签名互换），参数完整保留，无 variadic 转发风险
+// 保证「已经创建好配置的」WebView 也能拿到脚本：
+// hook -[WKWebView initWithFrame:configuration:]（WKWebView 本类实现，可安全交换）
 @interface WKWebView (QYXYHook)
+- (instancetype)qyxy_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)cfg;
+- (void)qyxy_register:(WKWebView *)self_;
+- (WKNavigation *)qyxy_loadRequest:(NSURLRequest *)req;
+- (WKNavigation *)qyxy_loadHTMLString:(NSString *)s baseURL:(NSURL *)u;
+- (WKNavigation *)qyxy_loadFileURL:(NSURL *)f allowingReadAccessToURL:(NSURL *)d;
+- (WKNavigation *)qyxy_loadData:(NSData *)data MIMEType:(NSString *)mt characterEncodingName:(NSString *)ce baseURL:(NSURL *)u;
 @end
 @implementation WKWebView (QYXYHook)
 
@@ -342,12 +348,42 @@ static void qy_inject_webview(WKWebView *wv) {
     [self qyxy_register:self];
     return [self qyxy_loadData:data MIMEType:mt characterEncodingName:ce baseURL:u];
 }
+
+// 注入 userScript 到即将使用的 configuration
+// 交换后 = 原实现
+- (instancetype)qyxy_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)cfg {
+    qy_install_userscript_on_config(cfg);
+    return [self qyxy_initWithFrame:frame configuration:cfg];
+}
 @end
 
+// ★ 安全 swizzle：必须「本类自己实现」的方法才允许交换。
+// 原因：class_getInstanceMethod 会沿继承链查找；若命中父类/NSObject 的方法（如 -copy），
+//       交换它 = 全局篡改父类行为 → 必崩。此前 swizzle WKWebViewConfiguration 的 -copy
+//       正是如此（copy 来自 NSObject），导致「初始化完成」后立刻 SIGSEGV。
 static void qy_swizzle(Class c, SEL a, SEL b) {
+    if (!c) return;
     Method m1 = class_getInstanceMethod(c, a);
     Method m2 = class_getInstanceMethod(c, b);
-    if (m1 && m2) method_exchangeImplementations(m1, m2);
+    if (!m1 || !m2) { qlog(@"⚠️ swizzle 跳过(方法缺失) %@ / %@", NSStringFromSelector(a), NSStringFromSelector(b)); return; }
+
+    unsigned int n = 0;
+    Method *list = class_copyMethodList(c, &n);
+    BOOL ownA = NO, ownB = NO;
+    for (unsigned int i = 0; i < n; i++) {
+        SEL s = method_getName(list[i]);
+        if (sel_isEqual(s, a)) ownA = YES;
+        if (sel_isEqual(s, b)) ownB = YES;
+    }
+    free(list);
+
+    if (ownA && ownB) {
+        method_exchangeImplementations(m1, m2);
+        qlog(@"✔ swizzle %@ %@ <-> %@", NSStringFromClass(c), NSStringFromSelector(a), NSStringFromSelector(b));
+    } else {
+        qlog(@"⚠️ 拒绝 swizzle %@ %@（非本类实现：ownA=%d ownB=%d）",
+             NSStringFromClass(c), NSStringFromSelector(ownA ? b : a), ownA, ownB);
+    }
 }
 
 #pragma mark - ★ 核心：WKUserScript 全 frame 注入（唯一能穿透跨域 iframe 的手段）
@@ -385,39 +421,23 @@ static void qy_install_userscript_on_config(WKWebViewConfiguration *cfg) {
     }
 }
 
-// hook -[WKWebViewConfiguration copy] 与 setUserContentController:，
-// 保证「已经创建好配置的」WebView 也能拿到脚本
-@interface WKWebViewConfiguration (QYXYHook)
-@end
-@implementation WKWebViewConfiguration (QYXYHook)
-- (id)qyxy_copy {
-    id c = [self qyxy_copy];             // 交换后 = 原 copy
-    qy_install_userscript_on_config((WKWebViewConfiguration *)c);
-    return c;
-}
-@end
-
-@interface WKUserContentController (QYXYHook)
-@end
-@implementation WKUserContentController (QYXYHook)
-- (void)qyxy_addUserScript:(WKUserScript *)s {
-    [self qyxy_addUserScript:s];         // 交换后 = 原实现
-}
-@end
-
 static void qy_hook_webview(void) {
     Class c = objc_getClass("WKWebView");
     if (!c) { qlog(@"⚠️ 未找到 WKWebView 类"); return; }
 
-    // 1) 全 frame 注入（主力）
-    qy_swizzle(objc_getClass("WKWebViewConfiguration"), @selector(copy), @selector(qyxy_copy));
+    // 先装一次全局 userScript（保证任何 config 都能拿到）
+    qy_user_script();
 
-    // 2) 记录 WebView + 兜底注入（部分壳自建 config，不经 copy 路径）
+    // 1) 全 frame 注入的主力：确保每个 WebView 的 configuration 都带 userScript
+    qy_swizzle(c, @selector(initWithFrame:configuration:), @selector(qyxy_initWithFrame:configuration:));
+
+    // 2) 记录 WebView + 兜底注入（部分壳自建 config，不经 initWithFrame: 路径）
     qy_swizzle(c, @selector(loadRequest:),            @selector(qyxy_loadRequest:));
     qy_swizzle(c, @selector(loadHTMLString:baseURL:), @selector(qyxy_loadHTMLString:baseURL:));
     qy_swizzle(c, @selector(loadFileURL:allowingReadAccessToURL:), @selector(qyxy_loadFileURL:allowingReadAccessToURL:));
     qy_swizzle(c, @selector(loadData:MIMEType:characterEncodingName:baseURL:), @selector(qyxy_loadData:MIMEType:characterEncodingName:baseURL:));
-    qlog(@"WKWebView hook 已装载（userScript + load*）");
+
+    qlog(@"WKWebView hook 完成");
 }
 
 #pragma mark - ===================== 面板 =====================
