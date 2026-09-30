@@ -571,6 +571,89 @@
     return rows;
   }
 
+  /* ================= 6c. 实体数据深挖（v1.8） ================= */
+  // 找 GameSceneATB 节点
+  function findATBNode() {
+    var node = null;
+    if (!window.Laya || !Laya.stage) return null;
+    (function fnd(n, d) {
+      if (!n || node || d > 8) return;
+      try { if ((n.constructor && n.constructor.name) === "GameSceneATB") { node = n; return; } } catch (e) {}
+      var kk = null; try { kk = n._children; } catch (e) {}
+      if (kk) for (var i = 0; i < kk.length; i++) fnd(kk[i], d + 1);
+    })(Laya.stage, 0);
+    return node;
+  }
+
+  // 收集 ATBEntity 节点
+  function collectATBEntities() {
+    var out = [];
+    var atb = findATBNode();
+    if (!atb) return out;
+    ["entityContainer", "entityFighttingContainer", "entityFightMark", "entityBottomContainer"].forEach(function (ck) {
+      var c = null; try { c = atb[ck]; } catch (e) {}
+      if (!c || !c.numChildren) return;
+      for (var i = 0; i < c.numChildren && out.length < 30; i++) {
+        var ch = null;
+        try { ch = c.getChildAt(i); } catch (e) {}
+        if (!ch) continue;
+        var cn = ""; try { cn = (ch.constructor && ch.constructor.name) || ""; } catch (e) {}
+        if (/ATBEntity|Entity/.test(cn)) out.push({ container: ck, index: i, node: ch, cls: cn });
+      }
+    });
+    return out;
+  }
+
+  // 静态字段表：class X { constructor(){ r(this, X.propertys) } }
+  function dumpPropertys() {
+    var o = [];
+    var names = ["SBattleFightEntity", "SBattleEntity", "SBattleInfo", "SBattleArrayData", "SBattleArrayInfo",
+                 "SFightAttribute", "SFightAttrs", "SAttribute", "SMiniPlayer", "SPublicPlayer",
+                 "TPlayerHero", "TPlayer", "TPlayerRole", "TPlayerExtend", "TPlayerAnimal", "TPlayerZhenFa",
+                 "AttrData", "FightHurtData", "HeroData", "HeroMonsterData", "DataEntity", "CLevel"];
+    names.forEach(function (n) {
+      var f = window[n] || (window.msg && window.msg[n]);
+      if (typeof f !== "function") { o.push("  " + n + " = 非函数/" + (typeof f)); return; }
+      var p = f.propertys;
+      if (p === undefined) {
+        // 尝试在原型/自身找
+        var cand = null;
+        try { for (var k in f) { if (/propert|PROPERT|field|Field/i.test(k)) { cand = f[k]; break; } } } catch (e) {}
+        if (cand) p = cand;
+      }
+      if (p === undefined) { o.push("  " + n + ".propertys = undefined（另有键: " + (function () { try { return Object.keys(f).join(","); } catch (e) { return "?"; } })() + "）"); return; }
+      var s = "";
+      try { s = JSON.stringify(p); } catch (e) { s = "[" + String(p) + "]"; }
+      o.push("  ★ " + n + ".propertys = " + (s || "").slice(0, 3000));
+    });
+    return o;
+  }
+
+  // 真实 entityData 转储
+  function dumpEntityData() {
+    var o = [];
+    var ents = collectATBEntities();
+    o.push("  ATBEntity 数 = " + ents.length);
+    ents.slice(0, 6).forEach(function (e) {
+      var ed = null; try { ed = e.node.entityData; } catch (err) {}
+      var cn = "?"; try { cn = (ed && ed.constructor && ed.constructor.name) || typeof ed; } catch (err) {}
+      o.push("  -- " + e.container + "[" + e.index + "] <" + e.cls + ">  entityData=<" + cn + ">");
+      if (ed && typeof ed === "object") {
+        o.push("     keys: " + (function () { try { return Object.keys(ed).join(","); } catch (x) { return "ERR"; } })());
+        o.push("     dump:\n       " + dumpObj(ed, 120));
+      }
+      // 节点自身业务字段
+      ["entityData", "attrData", "heroData", "configData", "posIndex", "maxNuQi", "nuQi", "hp", "curHp", "attr"].forEach(function (k) {
+        var v = null;
+        try { v = e.node[k]; } catch (err) { return; }
+        if (v === undefined) return;
+        if (typeof v === "object" && v) o.push("     node." + k + " = <" + ((v.constructor && v.constructor.name) || "obj") + ">");
+        else o.push("     node." + k + " = " + v);
+      });
+    });
+    return o;
+  }
+
   /* ================= 7b. 同源 iframe 递归走访（appack 平台壳可直达 SDK 壳） ================= */
   function walkSameOrigin(w, tag, depth, out) {
     if (!w || depth > 4) return;
@@ -650,55 +733,36 @@
       o.push("  units=" + S.units + " speed=" + S.speedApplied + " ad=" + JSON.stringify(S.adWrapped));
       // ★ 游戏帧专属深挖
       if (S.isGame) {
-        o.push("\n--- ★ msg 序列化器源码提取字段（SBattleEntity / SFightAttribute / SAttribute） ---");
-        ["SBattleEntity", "SBattleArrayData", "SBattleArrayInfo", "SBattleInfo",
-         "SFightAttribute", "SFightAttrs", "SAttribute", "SMiniPlayer", "TPlayerHero",
-         "TPlayerAnimal", "TPlayerZhenFa"].forEach(function (n) {
-          var f = window.msg && window.msg[n];
-          if (typeof f !== "function") { o.push("  msg." + n + " = 非函数/" + typeof f); return; }
-          var r = extractFieldsFromFn(f, 80);
-          if (r) {
-            o.push("  msg." + n + "  (srcLen=" + r.len + ")");
-            o.push("    fields: " + r.fields.join(", "));
-            o.push("    head: " + r.head);
-          }
-        });
+        o.push("\n--- ★★ 序列化器静态字段表 propertys（字段名权威来源） ---");
+        o.push(dumpPropertys().join("\n"));
+
+        o.push("\n--- ★★ 真实战斗实体 entityData 转储 ---");
+        o.push(dumpEntityData().join("\n"));
 
         o.push("\n--- ★ Laya.ClassUtils 真实键名与类表 ---");
         o.push("  " + classUtilsKeys().join("\n  "));
-
-        o.push("\n--- ★ 实体节点扫描（ATB 容器内带业务字段的节点） ---");
-        var ents = collectEntities();
-        o.push("  count=" + ents.length);
-        o.push("  " + ents.join("\n  "));
 
         o.push("\n--- 战斗容器候选（全局） ---");
         var bc = findBattleContainers();
         o.push("  count=" + bc.length);
         o.push("  " + bc.join("\n  "));
 
-        o.push("\n--- 游戏核心对象（net / spine / PackageMain / PackageSub / PackageLoading） ---");
-        ["net", "spine", "PackageMain", "PackageSub", "PackageLoading"].forEach(function (n) {
+        o.push("\n--- 游戏核心对象（net / spine / PackageMain） ---");
+        ["net", "PackageMain", "PackageSub", "PackageLoading"].forEach(function (n) {
           var v = window[n];
           o.push("  [" + n + "] " + (v ? "\n      " + dumpObj(v, 60) : "不存在"));
         });
 
-        o.push("\n--- GameSceneATB 转储（含 gameMap） ---");
+        o.push("\n--- GameSceneATB 转储 ---");
         try {
-          var atbNode = null;
-          (function fnd(n) {
-            if (!n || atbNode) return;
-            try { if ((n.constructor && n.constructor.name) === "GameSceneATB") { atbNode = n; return; } } catch (e) {}
-            var kk = null; try { kk = n._children; } catch (e) {}
-            if (kk) for (var i = 0; i < kk.length; i++) fnd(kk[i]);
-          })(window.Laya && Laya.stage);
+          var atbNode = findATBNode();
           if (atbNode) {
-            o.push("  ATB:\n      " + dumpObj(atbNode, 80));
-            if (atbNode.gameMap) o.push("  gameMap:\n      " + dumpObj(atbNode.gameMap, 120));
+            o.push("  ATB:\n      " + dumpObj(atbNode, 60));
+            if (atbNode.gameMap) o.push("  gameMap:\n      " + dumpObj(atbNode.gameMap, 60));
           }
         } catch (e) { o.push("  ATB ERR " + e); }
 
-        o.push("\n--- window 全清单 ---");
+        o.push("\n--- window 类清单（游戏自有类） ---");
         o.push("  " + windowInventory().join("\n  "));
       }
     }
