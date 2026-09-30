@@ -409,71 +409,119 @@
     return o.join("\n\n");
   }
 
-  /* ================= 6b. 深度目标探针（v1.6） ================= */
-  // 枚举 Laya 注册类（ClassUtils._classMap）—— 定位战斗数据类的最快途径
-  function layaClassMap() {
-    var out = [];
+  /* ================= 6b. 深度目标探针（v1.7） ================= */
+  // ★ 核心技巧：序列化器/构造函数的 toString() 源码里直接写着字段名 —— 不用猜
+  function extractFieldsFromFn(fn, maxNames) {
+    var s = "";
+    try { s = fn.toString(); } catch (e) { return null; }
+    if (!s || s.length < 10) return null;
+    var out = [], seen = {};
+    // 抽 this.xxx = / .xxx = / "xxx" / 'xxx' / e.xxx
+    var re = /(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]{1,32})\s*(?==|:|,|\])/g, m;
+    while ((m = re.exec(s)) !== null) {
+      var k = m[1];
+      if (/^(var|let|const|function|return|new|this|if|else|for|while|typeof|true|false|null|undefined|case|break|switch|default|try|catch)$/.test(k)) continue;
+      if (seen[k]) continue;
+      seen[k] = 1;
+      out.push(k);
+      if (out.length >= (maxNames || 60)) break;
+    }
+    return { len: s.length, fields: out, head: s.slice(0, 420).replace(/\s+/g, " ") };
+  }
+
+  // 枚举 Laya.ClassUtils 的真实键名
+  function classUtilsKeys() {
+    var o = [];
     try {
       var cu = window.Laya && Laya.ClassUtils;
-      if (!cu) return out;
-      var maps = [cu._classMap, cu.__classMap, cu._classMap2];
-      for (var mi = 0; mi < maps.length; mi++) {
-        var m = maps[mi];
-        if (!m) continue;
-        for (var k in m) {
-          if (/Battle|Fight|Unit|Hero|Player|Monster|Enemy|Mgr|Manager|Model|Data|Buff|Skill|Role|Soldier|Army|Team|Group|Actor/i.test(k)) {
-            out.push(k);
-          }
-          if (out.length > 300) break;
+      if (!cu) return ["<无 Laya.ClassUtils>"];
+      var ks = [];
+      for (var k in cu) ks.push(k + ":" + (typeof cu[k]));
+      o.push("ClassUtils keys = " + ks.join(", "));
+      // 逐个尝试常见的类表键
+      ks.forEach(function (kk) {
+        var name = kk.split(":")[0];
+        var v = cu[name];
+        if (v && typeof v === "object") {
+          var n = 0, sample = [];
+          for (var q in v) { n++; if (sample.length < 200 && /Battle|Fight|Entity|Unit|Hero|Monster|Mgr|Manager|Model|Data|Buff|Skill|Role|Attr/i.test(q)) sample.push(q); }
+          o.push("  " + name + " = object{" + n + "} 战斗相关=" + sample.length);
+          if (sample.length) o.push("    " + sample.join("\n    "));
         }
-      }
-    } catch (e) {}
-    return out;
+      });
+    } catch (e) { o.push("ERR " + e); }
+    return o;
   }
 
-  // 全局对象「全清单」：名字 + 构造器名 + 键数（不筛选，交给分析端）
-  function windowInventory() {
-    var rows = [];
-    try {
-      for (var k in window) {
-        if (/^(on|webkit|__qyxy)/.test(k)) continue;
-        var v;
-        try { v = window[k]; } catch (e) { continue; }
-        if (v === null || v === undefined) continue;
-        var t = typeof v;
-        if (t === "function") { rows.push(k + ":fn"); continue; }
-        if (t !== "object") { rows.push(k + ":" + t); continue; }
-        var cn = (v.constructor && v.constructor.name) || "?";
-        if (Array.isArray(v)) { rows.push(k + ":" + cn + "[len=" + v.length + "]"); continue; }
-        var n = 0;
-        try { for (var q in v) { n++; if (n > 400) break; } } catch (e) {}
-        rows.push(k + ":" + cn + "{" + n + "}");
-        if (rows.length > 400) break;
-      }
-    } catch (e) {}
-    return rows;
-  }
-
-  // 对目标对象做逐键类型转储
   function dumpObj(v, lim) {
-    var o = [];
-    var n = 0;
+    var o = [], n = 0;
     try {
       for (var k in v) {
         var x; try { x = v[k]; } catch (e) { o.push(k + "=<throw>"); continue; }
         var t = typeof x;
-        if (t === "number" || t === "string" || t === "boolean") o.push(k + "=" + x);
+        if (t === "number" || t === "string" || t === "boolean") o.push(k + "=" + (t === "string" ? JSON.stringify(String(x).slice(0, 80)) : x));
         else if (t === "function") o.push(k + "=fn");
         else if (x === null) o.push(k + "=null");
+        else if (x === undefined) o.push(k + "=undef");
         else if (Array.isArray(x)) o.push(k + "=Array(" + x.length + ")");
-        else o.push(k + "=" + ((x.constructor && x.constructor.name) || t));
-        if (++n >= (lim || 120)) { o.push("...(truncated)"); break; }
+        else o.push(k + "=" + ((x && x.constructor && x.constructor.name) || t));
+        if (++n >= (lim || 300)) { o.push("...(+" + n + ")"); break; }
       }
     } catch (e) { o.push("ERR " + e); }
     return o.join("\n      ");
   }
 
-  // 在全局里找「战斗/单位容器」候选：数组元素含 hp/atk 类字段，或类名匹配
+  // 从 Laya 容器递归收集「实体对象」（Sprite 子节点上的业务引用）
+  function collectEntities() {
+    var out = [], seen = [];
+    if (!window.Laya || !Laya.stage) return out;
+    function findByName(n, name) {
+      if (!n) return null;
+      try { if ((n.constructor && n.constructor.name) === name) return n; } catch (e) {}
+      var kids = null; try { kids = n._children; } catch (e) {}
+      if (kids) for (var i = 0; i < kids.length; i++) { var r = findByName(kids[i], name); if (r) return r; }
+      return null;
+    }
+    function walk(n, depth, path) {
+      if (!n || depth > 6 || out.length > 60) return;
+      if (seen.indexOf(n) >= 0) return;
+      seen.push(n);
+      // 节点自身的「非 Laya 内部」字段
+      var extra = [];
+      try {
+        var ks = Object.keys(n);
+        for (var i = 0; i < ks.length && extra.length < 30; i++) {
+          var k = ks[i];
+          if (/^(_|$|on[A-Z]|destroyed|name$|visible|zOrder|mouseState|renderType|texture|graphics)/.test(k)) continue;
+          var v = n[k], t = typeof v;
+          if (t === "number") extra.push(k + "=" + v);
+          else if (t === "string") extra.push(k + "=" + JSON.stringify(String(v).slice(0, 40)));
+          else if (v && t === "object") extra.push(k + "=" + ((v.constructor && v.constructor.name) || "obj"));
+        }
+      } catch (e) {}
+      if (extra.length) {
+        var cls = ""; try { cls = (n.constructor && n.constructor.name) || "?"; } catch (e) {}
+        out.push(path + " <" + cls + "> " + extra.join(" "));
+      }
+      var kids = null; try { kids = n._children; } catch (e) {}
+      if (kids) for (var j = 0; j < kids.length && j < 40; j++) walk(kids[j], depth + 1, path + "/" + j);
+    }
+    try {
+      var atb = findByName(Laya.stage, "GameSceneATB");
+      if (atb) {
+        ["gameMap", "entityContainer", "entityFighttingContainer", "entityFightMark", "entityBottomContainer", "hurtContainer", "viewContainer"].forEach(function (k) {
+          var v = null; try { v = atb[k]; } catch (e) {}
+          if (!v) return;
+          out.push(">> ATB." + k + " <" + ((v.constructor && v.constructor.name) || typeof v) + ">");
+          if (v.numChildren !== undefined) out.push("   numChildren=" + v.numChildren);
+          walk(v, 0, "ATB." + k);
+        });
+      }
+    } catch (e) { out.push("ATB ERR " + e); }
+    return out;
+  }
+
+  // 全局对象里找「带战斗单位特征」的对象
   function findBattleContainers() {
     var hits = [];
     try {
@@ -481,51 +529,46 @@
         if (/^(on|webkit|__qyxy)/.test(k)) continue;
         var v; try { v = window[k]; } catch (e) { continue; }
         if (!v || typeof v !== "object") continue;
-        var cn = (v.constructor && v.constructor.name) || "";
-        if (/Battle|Fight|Unit|Hero|Monster|Enemy|Actor|Team|Army/i.test(k + cn)) {
+        var cn = ""; try { cn = (v.constructor && v.constructor.name) || ""; } catch (e) {}
+        if (/Battle|Fight|Entity|Unit|Hero|Monster|Enemy|Actor|Team|Army|Scene/i.test(k + cn)) {
           var ks = [];
-          try { for (var q in v) { ks.push(q); if (ks.length > 60) break; } } catch (e) {}
+          try { for (var q in v) { ks.push(q); if (ks.length > 80) break; } } catch (e) {}
           hits.push("GLOBAL " + k + " <" + cn + "> keys=" + ks.join(","));
         }
-        if (Array.isArray(v) && v.length) {
-          var e0 = v[0];
-          if (e0 && typeof e0 === "object") {
-            var ks2 = [], sc = 0;
-            try {
-              for (var q2 in e0) {
-                ks2.push(q2);
-                if (HP_PAT.test(q2) || MAXH_PAT.test(q2) || ATK_PAT.test(q2)) sc += 3;
-                if (ks2.length > 60) break;
-              }
-            } catch (e) {}
-            if (sc >= 3) hits.push("ARRAY " + k + "[len=" + v.length + "] <" + ((e0.constructor && e0.constructor.name) || "?") + "> score=" + sc + " keys=" + ks2.join(","));
-          }
+        if (Array.isArray(v) && v.length && v[0] && typeof v[0] === "object") {
+          var ks2 = [], sc = 0;
+          try {
+            for (var q2 in v[0]) {
+              ks2.push(q2);
+              if (HP_PAT.test(q2) || MAXH_PAT.test(q2) || ATK_PAT.test(q2)) sc += 3;
+              if (ks2.length > 80) break;
+            }
+          } catch (e) {}
+          if (sc >= 3) hits.push("ARRAY " + k + "[len=" + v.length + "] score=" + sc + " keys=" + ks2.join(","));
         }
       }
     } catch (e) {}
     return hits;
   }
 
-  // 从 Laya 场景节点向上/向下找其持有的数据对象
-  function dumpSceneATB() {
-    var o = [];
-    if (!window.Laya || !Laya.stage) return o;
-    function findByName(n, name) {
-      if (!n) return null;
-      var cn = "";
-      try { cn = (n.constructor && n.constructor.name) || ""; } catch (e) {}
-      if (cn === name) return n;
-      var kids = null; try { kids = n._children; } catch (e) {}
-      if (kids) for (var i = 0; i < kids.length; i++) { var r = findByName(kids[i], name); if (r) return r; }
-      return null;
-    }
+  function windowInventory() {
+    var rows = [];
     try {
-      var atb = findByName(Laya.stage, "GameSceneATB");
-      if (atb) {
-        o.push("GameSceneATB keys:"); o.push("      " + dumpObj(atb, 150));
-      } else { o.push("GameSceneATB 未找到"); }
-    } catch (e) { o.push("ATB ERR " + e); }
-    return o;
+      for (var k in window) {
+        if (/^(on|webkit|__qyxy)/.test(k)) continue;
+        var v; try { v = window[k]; } catch (e) { continue; }
+        if (v === null || v === undefined) continue;
+        var t = typeof v;
+        if (t === "function") { rows.push(k + ":fn"); continue; }
+        if (t !== "object") continue;
+        var cn = "?"; try { cn = (v.constructor && v.constructor.name) || "?"; } catch (e) {}
+        if (Array.isArray(v)) { rows.push(k + ":" + cn + "[len=" + v.length + "]"); continue; }
+        var n = 0; try { for (var q in v) { n++; if (n > 500) break; } } catch (e) {}
+        rows.push(k + ":" + cn + "{" + n + "}");
+        if (rows.length > 300) break;
+      }
+    } catch (e) {}
+    return rows;
   }
 
   /* ================= 7b. 同源 iframe 递归走访（appack 平台壳可直达 SDK 壳） ================= */
@@ -607,23 +650,56 @@
       o.push("  units=" + S.units + " speed=" + S.speedApplied + " ad=" + JSON.stringify(S.adWrapped));
       // ★ 游戏帧专属深挖
       if (S.isGame) {
-        o.push("\n--- Laya 注册类（战斗/数据相关） ---");
-        var cm = layaClassMap();
-        o.push("  count=" + cm.length);
-        o.push("  " + cm.join("\n  "));
-        o.push("\n--- GameSceneATB 数据转储 ---");
-        o.push("  " + dumpSceneATB().join("\n  "));
-        o.push("\n--- 战斗容器候选 ---");
+        o.push("\n--- ★ msg 序列化器源码提取字段（SBattleEntity / SFightAttribute / SAttribute） ---");
+        ["SBattleEntity", "SBattleArrayData", "SBattleArrayInfo", "SBattleInfo",
+         "SFightAttribute", "SFightAttrs", "SAttribute", "SMiniPlayer", "TPlayerHero",
+         "TPlayerAnimal", "TPlayerZhenFa"].forEach(function (n) {
+          var f = window.msg && window.msg[n];
+          if (typeof f !== "function") { o.push("  msg." + n + " = 非函数/" + typeof f); return; }
+          var r = extractFieldsFromFn(f, 80);
+          if (r) {
+            o.push("  msg." + n + "  (srcLen=" + r.len + ")");
+            o.push("    fields: " + r.fields.join(", "));
+            o.push("    head: " + r.head);
+          }
+        });
+
+        o.push("\n--- ★ Laya.ClassUtils 真实键名与类表 ---");
+        o.push("  " + classUtilsKeys().join("\n  "));
+
+        o.push("\n--- ★ 实体节点扫描（ATB 容器内带业务字段的节点） ---");
+        var ents = collectEntities();
+        o.push("  count=" + ents.length);
+        o.push("  " + ents.join("\n  "));
+
+        o.push("\n--- 战斗容器候选（全局） ---");
         var bc = findBattleContainers();
         o.push("  count=" + bc.length);
         o.push("  " + bc.join("\n  "));
+
+        o.push("\n--- 游戏核心对象（net / spine / PackageMain / PackageSub / PackageLoading） ---");
+        ["net", "spine", "PackageMain", "PackageSub", "PackageLoading"].forEach(function (n) {
+          var v = window[n];
+          o.push("  [" + n + "] " + (v ? "\n      " + dumpObj(v, 60) : "不存在"));
+        });
+
+        o.push("\n--- GameSceneATB 转储（含 gameMap） ---");
+        try {
+          var atbNode = null;
+          (function fnd(n) {
+            if (!n || atbNode) return;
+            try { if ((n.constructor && n.constructor.name) === "GameSceneATB") { atbNode = n; return; } } catch (e) {}
+            var kk = null; try { kk = n._children; } catch (e) {}
+            if (kk) for (var i = 0; i < kk.length; i++) fnd(kk[i]);
+          })(window.Laya && Laya.stage);
+          if (atbNode) {
+            o.push("  ATB:\n      " + dumpObj(atbNode, 80));
+            if (atbNode.gameMap) o.push("  gameMap:\n      " + dumpObj(atbNode.gameMap, 120));
+          }
+        } catch (e) { o.push("  ATB ERR " + e); }
+
         o.push("\n--- window 全清单 ---");
         o.push("  " + windowInventory().join("\n  "));
-        o.push("\n--- 关键全局对象逐键转储 ---");
-        ["ConstDefine", "EventId", "msg", "PkgNameEnum", "GameData", "globalVars"].forEach(function (n) {
-          var v = window[n];
-          o.push("  [" + n + "] " + (v ? "\n      " + dumpObj(v, 80) : "不存在"));
-        });
       }
     }
     window.__qyxy_probe = o.join("\n");
