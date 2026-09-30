@@ -286,13 +286,40 @@
     try {
       if (window.Laya && Laya.stage) {
         o.push("  Laya.stage numChildren=" + Laya.stage.numChildren +
-               " frameRate=" + Laya.stage.frameRate + " timer.scale=" + (Laya.timer && Laya.timer.scale));
+               " frameRate=" + Laya.stage.frameRate + " timer.scale=" + (Laya.timer && Laya.timer.scale) +
+               " designW=" + Laya.stage.designWidth + " designH=" + Laya.stage.designHeight);
+        // ★ 显示树转储（3 层）：类名 + 名称 + 子数
+        var treeLines = [];
+        (function dump(n, d, pa) {
+          if (!n || d > 3 || treeLines.length > 120) return;
+          var cls = (n.constructor && n.constructor.name) || "?";
+          var nm = "";
+          try { nm = n.name || ""; } catch (e) {}
+          var nk = "";
+          try { nk = numKeys(n, 12).join(","); } catch (e) {}
+          treeLines.push("      " + pa + cls + (nm ? "(" + nm + ")" : "") + (nk ? " {" + nk + "}" : ""));
+          var kids = null;
+          try { kids = n._children; } catch (e) {}
+          if (kids && kids.length) {
+            for (var q = 0; q < kids.length && q < 24; q++) dump(kids[q], d + 1, pa + "  ");
+          }
+        })(Laya.stage, 0, "");
+        o.push("  --- Laya 显示树 ---");
+        o.push(treeLines.join("\n"));
         var ls = layaScan();
         o.push("  layaUnits=" + ls.length);
-        ls.slice(0, 12).forEach(function (u) {
+        ls.slice(0, 15).forEach(function (u) {
           o.push("    " + u.path + " <" + u.cls + "> hp=[" + u.hp.join(",") + "] atk=[" + u.atk.join(",") + "] keys=[" + u.keys.join(",") + "]");
         });
       }
+    } catch (e) {}
+    // Laya 全局管理器 / 游戏模块
+    try {
+      ["gModBase", "gConfig", "gView", "ZKSDK", "globalVars", "GameData", "gameData", "DataMgr", "ConfigMgr"].forEach(function (n) {
+        var v = window[n];
+        if (!v) return;
+        o.push("  global." + n + " = " + (typeof v) + " keys=" + keysOf(v, 60));
+      });
     } catch (e) {}
     // 全局数值对象
     try {
@@ -301,6 +328,25 @@
       gs.slice(0, 10).forEach(function (u) {
         o.push("    " + u.name + " <" + u.cls + "> keys=[" + u.keys.join(",") + "]");
       });
+    } catch (e) {}
+    // 全局对象枚举（找游戏管理器）
+    try {
+      var suspects = [];
+      for (var kk in window) {
+        if (/^(on|webkit|__|\$|_)/.test(kk)) continue;
+        var vv;
+        try { vv = window[kk]; } catch (e) { continue; }
+        if (!vv || typeof vv !== "object") continue;
+        if (Array.isArray(vv) && vv.length > 3) {
+          var c0 = vv[0];
+          suspects.push(kk + "[len=" + vv.length + "]<" + ((c0 && c0.constructor && c0.constructor.name) || "?") + ">");
+        } else {
+          var nk2 = numKeys(vv, 30);
+          if (nk2.length >= 6) suspects.push(kk + "<" + ((vv.constructor && vv.constructor.name) || "?") + "> {" + nk2.slice(0, 14).join(",") + "}");
+        }
+        if (suspects.length > 40) break;
+      }
+      if (suspects.length) { o.push("  --- 全局对象候选 ---"); o.push("    " + suspects.join("\n    ")); }
     } catch (e) {}
     o.push("  speed=" + S.speedApplied + " adWrapped=" + JSON.stringify(S.adWrapped) + " err=" + (S.err || "-"));
     return o.join("\n");
@@ -404,12 +450,14 @@
     }
   }
 
-  /* ================= 8. 状态回读（原生逐 frame 调用） ================= */
+  /* ================= 8. 状态回读（原生逐 frame 调用 + 子帧定时上报） ================= */
   function localState() {
+    detect();                     // ★ 每次重新探测：脚本在 AtDocumentStart 注入时 Laya 尚未加载
     var cfg = window.__qyxy_cfg || {};
     applyAll();
     if (cfg.speed > 1.0001 || cfg.speed < 0.9999) applySpeed(cfg.speed);
     S.units = layaScan().length + globalScan().length;
+    maybeProbe();                 // ★ 子帧也要能生成探针（此前只有顶层 __qyxy_state 处理 probe）
     return "href=" + S.href.slice(0, 130) +
            "|eng=" + S.engine + "|laya=" + S.layaVer +
            "|game=" + (S.isGame ? 1 : 0) +
@@ -420,12 +468,13 @@
            "|ad=" + S.adWrapped.length + "|err=" + (S.err || "-");
   }
 
-  window.__qyxy_state = function () {
+  function maybeProbe() {
     var cfg = window.__qyxy_cfg || {};
-    if (cfg.probe) {
-      cfg.probe = false;
-      var o = [];
-      o.push("=== QYXY probe v3 ===");
+    if (!cfg.probe) return;
+    cfg.probe = false;
+    var o = [];
+    if (IS_TOP) {
+      o.push("=== QYXY probe v4 " + new Date().toISOString() + " ===");
       o.push(localProbeText());
       o.push("\n--- 同源 iframe 递归走访 ---");
       try { walkSameOrigin(window, "top", 0, o); } catch (e) { o.push("walkERR " + e); }
@@ -434,16 +483,30 @@
       for (var k in f) if (f[k] && f[k].probe) o.push(f[k].probe);
       o.push("\n--- 跨域 frame 状态 ---");
       for (var k2 in f) if (f[k2] && f[k2].state) o.push(f[k2].state);
-      window.__qyxy_probe = o.join("\n");
-      // 让子帧也各自生成 probe
-      broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: true });
+    } else {
+      o.push(localProbeText());
+      o.push("  units=" + S.units + " speed=" + S.speedApplied + " ad=" + JSON.stringify(S.adWrapped));
     }
-    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: false });
-    var st = aggState();
+    window.__qyxy_probe = o.join("\n");
+  }
+
+  window.__qyxy_state = function () {
+    var cfg = window.__qyxy_cfg || {};
+    var st = localState();                                   // 内部会处理 probe（含递归走访）
     var pr = window.__qyxy_probe || aggProbe();
+    // 让子帧生成各自探针
+    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: true });
+    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: false });
     return "QYOK::" + st + (pr ? "\nQYPROBE::\n" + pr : "");
   };
-  if (!IS_TOP) setInterval(report, 700);
+  if (!IS_TOP) {
+    setInterval(report, 700);
+    // 子帧若收到 probe 请求，生成后立刻上报（避免等 700ms 周期）
+    setInterval(function () {
+      var c = window.__qyxy_cfg || {};
+      if (c.probe) { localState(); report(); }
+    }, 300);
+  }
 
   log("installed isTop=" + IS_TOP + " isGame=" + IS_GAME + " engine=" + S.engine + " " + S.layaVer);
   return localState();
