@@ -139,10 +139,9 @@ static UIView   *g_panel = nil;
 @interface QYXYPassView : UIView
 @end
 @implementation QYXYPassView
-// 依据（历次真机教训）：透传必须写在 UIWindow/根视图这一层，子视图重写无效
 - (UIView *)hitTest:(CGPoint)pt withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:pt withEvent:event];
-    if (hit == self) return nil;   // 空白区 → 交回下层游戏 window
+    if (hit == self) return nil;
     return hit;
 }
 @end
@@ -154,6 +153,36 @@ static UIView   *g_panel = nil;
 - (void)loadView { self.view = [[QYXYPassView alloc] initWithFrame:[UIScreen mainScreen].bounds]; }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+@end
+
+#pragma mark - 透传 UIWindow（★ 真机铁律：必须在 window 层重写，子视图层重写无效）
+// 仅当「球」或「面板」真正命中时 window 才参与触摸；其余位置 pointInside 返回 NO，
+// 事件直接落到下层游戏 window ⇒ 游戏可触摸 + 悬浮球同时可用。
+@interface QYXYPassWindow : UIWindow
+@end
+@implementation QYXYPassWindow
+
+- (BOOL)qy_hitSelfSubviews:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *root = self.rootViewController.view;
+    for (UIView *v in root.subviews) {
+        if (v.hidden || v.alpha < 0.01 || !v.userInteractionEnabled) continue;
+        CGPoint p = [v convertPoint:point fromView:self];
+        if ([v pointInside:p withEvent:event]) return YES;   // 交由其自身 hitTest 细分（球/面板/按钮）
+    }
+    return NO;
+}
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return [self qy_hitSelfSubviews:point withEvent:event];
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (![self qy_hitSelfSubviews:point withEvent:event]) return nil;   // 空白区 → 穿透，game window 收事件
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self) return nil;
+    if (hit == self.rootViewController.view) return nil;
+    return hit;
+}
 @end
 
 static UIView *qy_ball_view(CGFloat size) {
@@ -481,26 +510,42 @@ static BOOL g_ballMoved = NO;
 @end
 
 #pragma mark - ===================== 安装 =====================
-static void qy_install_window(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_win && g_win.rootViewController && g_ball.superview) return;
-
-        g_win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        g_win.windowLevel = CGFLOAT_MAX;     // 独立窗口，最高层级
-        g_win.rootViewController = [[QYXYRootVC alloc] init];
-        g_win.backgroundColor = [UIColor clearColor];
-#if TARGET_OS_IOS
-        if (@available(iOS 13.0, *)) {
-            for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-                if ([sc isKindOfClass:[UIWindowScene class]] && sc.activationState != UISceneActivationStateUnattached) {
-                    g_win.windowScene = (UIWindowScene *)sc;
-                    break;
-                }
+static UIWindowScene *qy_active_scene(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]] &&
+                sc.activationState == UISceneActivationStateForegroundActive) {
+                return (UIWindowScene *)sc;
             }
         }
-#endif
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]] &&
+                sc.activationState != UISceneActivationStateUnattached) {
+                return (UIWindowScene *)sc;
+            }
+        }
+    }
+    return nil;
+}
+
+static void qy_install_window(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // 保活：window 被摘除 / 球被移除 / windowScene 丢失 → 重建
+        BOOL alive = (g_win && !g_win.hidden && g_win.windowScene != nil && g_ball.superview != nil);
+        if (alive) return;
+        if (g_win) { g_win = nil; g_ball = nil; g_panel = nil; g_note = nil; }
+
+        g_win = [[QYXYPassWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        g_win.windowLevel = UIWindowLevelAlert + 100;   // 独立窗口，高于游戏层但不至于 CGFLOAT_MAX
+        g_win.rootViewController = [[QYXYRootVC alloc] init];
+        g_win.backgroundColor = [UIColor clearColor];
+        // 显式绑定 windowScene（iOS 13+ 不绑定则窗口不参与触摸派发/不显示）
+        UIWindowScene *scene = qy_active_scene();
+        if (scene) g_win.windowScene = scene;
         g_win.hidden = NO;
-        [g_win makeKeyAndVisible];
+        // 刻意不调用 makeKeyAndVisible：键窗口必须留给游戏，否则会抢走输入焦点
+        [g_win setHidden:NO];
+        qlog(@"window 挂载 level=%.0f scene=%@", g_win.windowLevel, scene ? @"有" : @"无");
 
         UIView *root = g_win.rootViewController.view;
         g_ball = [[UIView alloc] initWithFrame:CGRectMake(root.bounds.size.width - 74, 120, BALL_SIZE, BALL_SIZE)];
