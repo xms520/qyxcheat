@@ -1,330 +1,397 @@
-/* QYXY_inject.js — 奇遇西游助手 Web 侧注入脚本
- * 由 gen_js.py 转成 C 字符串头文件后编入 dylib，运行时 evaluateJavaScript 注入。
- * 设计原则：引擎无关（运行时探测）+ 只做高置信度的通用改写，其余交给探针。
+/* QYXY_inject.js v2 — 奇遇西游助手 Web 侧注入（多 frame 版）
+ * 关键：本脚本会被注入到【每一个 frame】（含跨域 iframe），每个 frame 独立执行。
+ * 已确认架构（2026-09-30 实测）：
+ *   App → WKWebView(appack.zkyouxi.com 平台壳) → iframe(SDK壳) → iframe(dl-qyxx.gzdlm.com 游戏)
+ *   引擎 = LayaAir 2.13.3 + FairyGUI + qyscript
  */
 (function () {
   if (window.__qyxy_installed) { window.__qyxy_cfg && (window.__qyxy_cfg.reload = true); return "already"; }
   window.__qyxy_installed = true;
 
+  var IS_TOP = (function () { try { return window === window.top; } catch (e) { return false; } })();
+  var IS_GAME = /dl-qyxx|gzdlm\.com\/game|gameID=/.test(location.href) ||
+                (typeof Laya !== "undefined" && !!Laya.stage);
+
   var S = {
-    version: "1.0",
-    engine: "unknown",
-    engineDetail: "",
-    hpKeys: [],
+    v: "2.0",
+    href: location.href,
+    isTop: IS_TOP,
+    isGame: IS_GAME,
+    engine: "?",
+    layaVer: "",
+    fgui: false,
     units: 0,
-    kills: 0,
+    unitSample: "",
+    hpFields: [],
     godHits: 0,
+    kills: 0,
     adWrapped: [],
-    lastErr: "",
-    notes: ""
+    speedApplied: 0,
+    err: "",
+    probe: ""
   };
-  // 原生侧每秒写一次
+
   window.__qyxy_cfg = { god: false, kill: false, noAd: false, speed: 1.0, probe: false, tick: 0 };
+  window.__qyxy_probe = "";
 
   function log(s) { try { console.log("[QYXY] " + s); } catch (e) {} }
 
-  /* ---------------- 1. 加速：包 requestAnimationFrame / performance.now ---------------- */
+  /* ================= 1. 引擎探测 ================= */
+  function detect() {
+    try {
+      if (window.Laya) {
+        S.engine = "LayaAir";
+        S.layaVer = (Laya.__version__ || (Laya.version) || "") + " " + (window.Laya3D ? "3D" : "2D");
+        if (Laya.Stage && Laya.Stage.__version) S.layaVer += " stageV=" + Laya.Stage.__version;
+      } else if (window.fairygui || window.fgui) {
+        S.engine = "FairyGUI-only";
+      } else if (window.CocosEngine) {
+        S.engine = "CocosCreator " + (window.CocosEngine.version || "");
+      } else if (window.cc) {
+        S.engine = "cocos2d-js";
+      } else if (window.egret) { S.engine = "Egret"; }
+      else if (window.PIXI) { S.engine = "Pixi"; }
+      else if (window.Phaser) { S.engine = "Phaser"; }
+      else if (window.createUnityInstance) { S.engine = "UnityWebGL"; }
+    } catch (e) {}
+    try { S.fgui = !!(window.fairygui || window.fgui || (window.Laya && Laya.Browser && Laya.Browser.window.fairygui)); } catch (e) {}
+    return S.engine;
+  }
+  detect();
+
+  /* ================= 2. 加速（Laya 原生计时器倍率 + RAF 兜底） ================= */
   var realRAF = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : null;
-  var realNow = window.performance && performance.now ? performance.now.bind(performance) : null;
   var speed = 1.0;
-  var lastReal = realNow ? realNow() : Date.now();
-  var virtElapsed = 0;
 
   window.requestAnimationFrame = function (cb) {
     if (!realRAF) return 0;
     if (speed <= 1.0001) return realRAF(cb);
-    // 倍数越高，同一帧内重复回调次数越多 —— 时间轴整体前移
     var factor = Math.min(16, Math.max(1, Math.round(speed)));
-    var rafId = 0;
-    var first = true;
-    rafId = realRAF(function step(ts) {
-      if (first) { cb(ts); first = false; }
-      else {
-        for (var i = 1; i < factor; i++) { try { cb(ts) } catch (e) { S.lastErr = "" + e; break; } }
-      }
+    return realRAF(function (ts) {
+      cb(ts);
+      for (var i = 1; i < factor; i++) { try { cb(ts); } catch (e) { S.err = "" + e; break; } }
     });
-    return rafId;
   };
 
-  if (window.performance && realNow) {
-    var origPerfNow = window.performance.now;
+  function applySpeed(mult) {
+    speed = mult > 1 ? mult : 1.0;
+    S.speedApplied = speed;
     try {
-      window.performance.now = function () {
-        var r = realNow();
-        if (speed <= 1.0001) { lastReal = r; virtElapsed = 0; return r; }
-        var d = r - lastReal; lastReal = r;
-        virtElapsed += d * speed;
-        return r + virtElapsed * 0; // 保持单调；真实时间由 RAF 放大
-      };
-    } catch (e) {}
-    void origPerfNow;
-  }
-
-  /* ---------------- 2. 引擎探测 ---------------- */
-  function detectEngine() {
-    var w = window, hits = [];
-    if (w.cc && (w.cc.game || w.cc.director)) { S.engine = "cocos2d-js"; }
-    else if (w.Laya) { S.engine = "Laya"; }
-    else if (w.egret) { S.engine = "Egret"; }
-    else if (w.PIXI) { S.engine = "Pixi"; }
-    else if (w.Phaser) { S.engine = "Phaser"; }
-    else if (w.THREE) { S.engine = "three"; }
-    else if (w.createUnityInstance || w.unityFramework || w.UnityLoader) { S.engine = "UnityWebGL"; }
-    else if (w.GameGlobal || w.Laya || w.fgui) { S.engine = "Laya/FGUI"; }
-    else if (w.CocosEngine) { S.engine = "CocosCreator"; }
-    else if (w.__globalAdapter) { S.engine = "unknown(adapter)"; }
-
-    // 细分
-    try {
-      if (w.CocosEngine) {
-        var v = w.CocosEngine.version || "";
-        S.engineDetail = "cocos " + v +
-          (w.cc && w.cc.director ? " director=yes" : "") +
-          (w.cc && w.cc.game ? " game=yes" : "");
-      } else if (w.egret && w.egret.sys) {
-        S.engineDetail = "egret sys=" + (w.egret.sys ? 1 : 0) +
-          " capi=" + (w.egret.Capabilities ? JSON.stringify(w.egret.Capabilities.runtimeType) : "?");
-      } else if (w.Laya && w.Laya.version) {
-        S.engineDetail = "laya " + w.Laya.version;
+      // ★ LayaAir 官方全局时间缩放：定时器（loop/timerLoop/frameLoop 调度）总闸
+      if (window.Laya && Laya.timer) {
+        Laya.timer.scale = speed;
       }
-    } catch (e) {}
-
-    for (var k in w) {
-      if (/game|engine|main|player|render|scene/i.test(k) && typeof w[k] === "object" && w[k]) hits.push(k);
-      if (hits.length > 40) break;
-    }
-    S.notes = hits.join(",");
-    return S.engine;
+      // 帧率档位（影响渲染与 frameLoop 频率）
+      if (window.Laya && Laya.stage && Laya.Stage) {
+        Laya.stage.frameRate = speed >= 3 ? Laya.Stage.FRAME_FAST
+                             : speed >= 2 ? ("fast")
+                             : Laya.Stage.FRAME_SLOW;
+      }
+      // Laya 内部时间轴（tween）
+      if (window.Laya && Laya.Tween && Laya.Tween.prototype) {
+        if (!Laya.Tween.prototype.__qyxy_scaled) {
+          var origUpdate = Laya.Tween.prototype.update;
+          Laya.Tween.prototype.update = function (dt) {
+            var cfg = window.__qyxy_cfg || {};
+            var m = cfg.speed > 1 ? cfg.speed : 1;
+            return origUpdate.call(this, dt * m);
+          };
+          Laya.Tween.prototype.__qyxy_scaled = true;
+        }
+      }
+    } catch (e) { S.err = "" + e; }
   }
-  detectEngine();
 
-  /* ---------------- 3. HP 字段发现（引擎无关） ---------------- */
-  // 策略：从全局对象里找「对象集合」，抽查元素的数值字段，选出像 hp 的键。
-  var HP_PAT   = /^(hp|Hp|HP|health|Health|life|Life|blood|Blood|curHp|curHP|maxHp|maxHP|hpmax|hpMax|nowHp|hp_now)$/;
-  var MAXH_PAT = /^(maxHp|maxHP|maxhp|hpMax|hpmax|maxHealth|totalHp|fullHp)$/;
-  var ATK_PAT  = /^(atk|Atk|ATK|attack|Attack|damage|Damage|hurt|Hurt|power|Power|dmg)$/;
+  /* ================= 3. 战斗单位扫描（Laya 场景树 + 全局对象） ================= */
+  var HP_PAT   = /^(hp|Hp|HP|Health|health|life|Life|blood|Blood|curHp|curHP|nowHp|hp_now|hpCur)$/;
+  var MAXH_PAT = /^(maxHp|maxHP|maxhp|hpMax|hpmax|hp_max|maxHealth|totalHp|fullHp|hpMaxValue)$/;
+  var ATK_PAT  = /^(atk|Atk|ATK|attack|Attack|damage|Damage|hurt|Hurt|dmg|Dmg|power|Power|atkValue)$/;
+  var SPEED_PAT= /^(speed|Speed|moveSpeed|moveSpd|atkSpeed|attackSpeed|spd)$/;
 
-  function sampleKeys(obj, depth) {
-    // 返回 obj 中数值型字段名
+  function numKeys(o, lim) {
     var out = [];
     try {
-      for (var k in obj) {
-        if (k === "parent" || k === "children" || k === "scene" || k === "world") continue;
-        var v = obj[k];
+      var ks = Object.keys(o);
+      for (var i = 0; i < ks.length && out.length < (lim || 40); i++) {
+        var k = ks[i], v = o[k];
         if (typeof v === "number" && isFinite(v)) out.push(k);
-        if (out.length > 60) break;
       }
     } catch (e) {}
-    void depth;
     return out;
   }
 
-  function scanForUnits() {
-    var cands = [];
-    var roots = [];
-    // 常见挂载点
-    if (window.cc && cc.director && cc.director.getScene) roots.push(["cc.scene", cc.director.getScene()]);
-    if (window.egret && egret.DisplayObjectContainer) {
-      try { if (egret.MainContext && egret.MainContext.instance) roots.push(["egret.stage", egret.MainContext.instance.stage]); } catch (e) {}
-    }
-    if (window.Laya && Laya.stage) roots.push(["laya.stage", Laya.stage]);
-    if (window.game && game.scene) roots.push(["game.scene", game.scene]);
-    // 全局数组
-    for (var k in window) {
-      try {
-        var v = window[k];
-        if (!v) continue;
-        if (Array.isArray(v) && v.length > 0) cands.push([k, v]);
-        else if (typeof v === "object" && v.__classname__ && v.length > 0) cands.push([k, v]);
-      } catch (e) {}
-      if (cands.length > 30) break;
-    }
-    return { roots: roots, arrays: cands };
-  }
-
-  function inferHpKeys() {
-    var found = {};
-    var sc = scanForUnits();
-    var pools = sc.arrays.concat(sc.roots.map(function (r) {
-      var o = r[1], acc = [];
-      try { if (o && o.children) { for (var i = 0; i < o.children.length && i < 200; i++) acc.push(o.children[i]); } } catch (e) {}
-      return [r[0] + ".children", acc];
-    }));
-    pools.forEach(function (p) {
-      var arr = p[1];
-      if (!arr || !arr.length) return;
-      var n = Math.min(arr.length, 30), checked = 0;
-      for (var i = 0; i < n; i++) {
-        var o = arr[i]; if (!o || typeof o !== "object") continue;
-        checked++;
-        sampleKeys(o).forEach(function (k) {
-          if (HP_PAT.test(k)) found[k] = (found[k] || 0) + 1;
-        });
+  // 在 Laya stage 显示树上找「像战斗单位」的节点
+  function layaScan() {
+    var acc = [], seen = [], scanned = 0;
+    if (!window.Laya || !Laya.stage) return acc;
+    function walk(n, path, depth) {
+      if (!n || depth > 9 || acc.length > 80 || scanned > 3000) return;
+      if (seen.indexOf(n) >= 0) return;
+      seen.push(n); scanned++;
+      var nk = numKeys(n, 40);
+      var score = 0, hpF = [], atkF = [];
+      for (var i = 0; i < nk.length; i++) {
+        if (HP_PAT.test(nk[i])) { score += 3; hpF.push(nk[i]); }
+        if (MAXH_PAT.test(nk[i])) { score += 3; hpF.push(nk[i]); }
+        if (ATK_PAT.test(nk[i])) { score += 2; atkF.push(nk[i]); }
       }
-      if (checked) S.units = Math.max(S.units, checked);
-    });
-    S.hpKeys = Object.keys(found);
-    return S.hpKeys;
+      if (score >= 3) {
+        var cls = (n.constructor && n.constructor.name) || "(anon)";
+        acc.push({ path: path, cls: cls, keys: nk, hp: hpF, atk: atkF, obj: n });
+      }
+      var kids = null;
+      try { kids = n._children; } catch (e) {}
+      if (kids && kids.length) {
+        for (var j = 0; j < kids.length; j++) walk(kids[j], path + "/" + j, depth + 1);
+      } else if (typeof n.numChildren === "number" && n.numChildren > 0) {
+        for (var m = 0; m < n.numChildren; m++) {
+          try { walk(n.getChildAt(m), path + "/" + m, depth + 1); } catch (e) {}
+        }
+      }
+    }
+    walk(Laya.stage, "stage", 0);
+    return acc;
   }
-  inferHpKeys();
 
-  /* ---------------- 4. 每帧应用：无敌 / 秒杀 ---------------- */
-  var godHooked = false, killHooked = false;
-
-  function patchUnit(obj, cfg) {
-    // 无敌：把玩家单位 hp 抬回最大值
+  // 全局对象兜底（很多 Laya 游戏把管理器挂 window）
+  function globalScan() {
+    var acc = [];
     try {
-      if (cfg.god) {
-        for (var i = 0; i < S.hpKeys.length; i++) {
-          var k = S.hpKeys[i];
-          if (MAXH_PAT.test(k)) continue;
-          var maxK = null;
-          for (var j = 0; j < S.hpKeys.length; j++) if (MAXH_PAT.test(S.hpKeys[j])) { maxK = S.hpKeys[j]; break; }
-          if (maxK && typeof obj[maxK] === "number" && typeof obj[k] === "number") {
-            if (obj[k] !== obj[maxK]) { obj[k] = obj[maxK]; S.godHits++; }
+      for (var k in window) {
+        if (acc.length > 40) break;
+        if (/^(top|parent|self|window|document|location|history|navigator|Laya|fairygui|fgui|jQuery|\$)$/.test(k)) continue;
+        var o;
+        try { o = window[k]; } catch (e) { continue; }
+        if (!o || typeof o !== "object") continue;
+        if (Array.isArray(o)) {
+          if (o.length && typeof o[0] === "object" && o[0]) {
+            var nk = numKeys(o[0], 30), sc = 0;
+            for (var i = 0; i < nk.length; i++) if (HP_PAT.test(nk[i]) || MAXH_PAT.test(nk[i]) || ATK_PAT.test(nk[i])) sc += 3;
+            if (sc >= 3) acc.push({ name: k + "[" + o.length + "]", cls: (o[0].constructor && o[0].constructor.name) || "?", keys: nk, arr: o });
           }
+        } else {
+          var nk2 = numKeys(o, 30), sc2 = 0;
+          for (var j = 0; j < nk2.length; j++) if (HP_PAT.test(nk2[j]) || MAXH_PAT.test(nk2[j]) || ATK_PAT.test(nk2[j])) sc2 += 3;
+          if (sc2 >= 3) acc.push({ name: k, cls: (o.constructor && o.constructor.name) || "?", keys: nk2, obj: o });
+        }
+      }
+    } catch (e) {}
+    return acc;
+  }
+
+  /* ================= 4. 应用：无敌 / 秒杀 ================= */
+  function applyToUnit(o, cfg) {
+    try {
+      var ks = Object.keys(o);
+      var hpK = null, maxK = null;
+      for (var i = 0; i < ks.length; i++) {
+        if (HP_PAT.test(ks[i])) { hpK = ks[i]; break; }
+      }
+      for (var j = 0; j < ks.length; j++) {
+        if (MAXH_PAT.test(ks[j])) { maxK = ks[j]; break; }
+      }
+      if (cfg.god) {
+        if (hpK && maxK && typeof o[maxK] === "number") {
+          if (o[hpK] !== o[maxK]) { o[hpK] = o[maxK]; S.godHits++; }
+        } else if (hpK && typeof o[hpK] === "number") {
+          var snap = "__qyxy_hp0";
+          if (o[snap] === undefined) o[snap] = o[hpK];
+          if (o[hpK] < o[snap]) { o[hpK] = o[snap]; S.godHits++; }
         }
       }
       if (cfg.kill) {
-        for (var m = 0; m < S.hpKeys.length; m++) {
-          var kk = S.hpKeys[m];
-          if (MAXH_PAT.test(kk)) continue;
-          if (typeof obj[kk] === "number" && obj[kk] > 0) { obj[kk] = 0; S.kills++; }
+        if (hpK && typeof o[hpK] === "number" && o[hpK] > 0) { o[hpK] = 0; S.kills++; }
+      }
+    } catch (e) { S.err = "" + e; }
+  }
+
+  function applyAll() {
+    var cfg = window.__qyxy_cfg || {};
+    if (!cfg.god && !cfg.kill) return;
+    var ls = layaScan(), gs = globalScan();
+    S.units = ls.length + gs.length;
+    ls.forEach(function (u) { if (u.obj) applyToUnit(u.obj, cfg); });
+    gs.forEach(function (u) {
+      if (u.obj) applyToUnit(u.obj, cfg);
+      else if (u.arr) {
+        for (var i = 0; i < Math.min(u.arr.length, 200); i++) {
+          if (u.arr[i] && typeof u.arr[i] === "object") applyToUnit(u.arr[i], cfg);
         }
       }
-    } catch (e) { S.lastErr = "" + e; }
+    });
   }
 
-  function applyEachFrame() {
-    var cfg = window.__qyxy_cfg || {};
-    speed = cfg.speed > 1 ? cfg.speed : 1.0;
-    if (!cfg.god && !cfg.kill) return;
-    var sc = scanForUnits();
-    sc.arrays.forEach(function (p) {
-      var arr = p[1];
+  /* ================= 5. 免广告 ================= */
+  function wrapAds() {
+    ["showAd", "playAd", "showRewardedVideo", "showRewardAd", "showVideoAd", "showInterstitial",
+     "playVideo", "loadAd", "requestAd", "showVideo", "showRewarded"].forEach(function (n) {
       try {
-        for (var i = 0; i < Math.min(arr.length, 120); i++) {
-          var o = arr[i];
-          if (o && typeof o === "object") patchUnit(o, cfg);
-        }
-      } catch (e) {}
-    });
-    sc.roots.forEach(function (r) {
-      try {
-        var o = r[1];
-        if (o && o.children) for (var i = 0; i < Math.min(o.children.length, 120); i++) patchUnit(o.children[i], cfg);
-      } catch (e) {}
-    });
-    void godHooked; void killHooked;
-  }
-
-  /* ---------------- 5. 免广告 ---------------- */
-  function wrapAdOnce() {
-    ["showAd", "playAd", "showRewardedVideo", "showRewardAd", "playVideo", "showInterstitial",
-     "showVideoAd", "loadAd", "requestAd", "showVideo"].forEach(function (name) {
-      try {
-        var o = window[name];
-        if (typeof o === "function" && !o.__qyxy_wrapped) {
-          window[name] = function () {
+        var f = window[n];
+        if (typeof f === "function" && !f.__qyxy_w) {
+          window[n] = function () {
             var cfg = window.__qyxy_cfg || {};
             if (cfg.noAd) {
               var done = null;
-              for (var i = arguments.length - 1; i >= 0; i--) {
-                if (typeof arguments[i] === "function") { done = arguments[i]; break; }
-              }
+              for (var i = arguments.length - 1; i >= 0; i--) if (typeof arguments[i] === "function") { done = arguments[i]; break; }
               try { if (done) done({ ok: true, result: 1, isEnded: true, success: true }); } catch (e) {}
               setTimeout(function () { try { if (done) done({ ok: true, result: 1, isEnded: true, success: true }); } catch (e) {} }, 30);
               return;
             }
-            return o.apply(window, arguments);
+            return f.apply(window, arguments);
           };
-          window[name].__qyxy_wrapped = true;
-          S.adWrapped.push(name);
+          window[n].__qyxy_w = true;
+          S.adWrapped.push(n);
         }
       } catch (e) {}
     });
-    // 平台对象
     try {
       if (window.platform) {
-        ["showRewardAd", "showAd", "showVideoAd"].forEach(function (n) {
+        ["showRewardAd", "showAd", "showVideoAd", "playAd"].forEach(function (n) {
           var f = window.platform[n];
-          if (typeof f === "function" && !f.__qyxy_wrapped) {
+          if (typeof f === "function" && !f.__qyxy_w) {
             window.platform[n] = function () {
               var cfg = window.__qyxy_cfg || {};
-              if (cfg.noAd) {
-                try { if (window.Promise) return Promise.resolve({ result: 1, isEnded: true, ok: true }); } catch (e) {}
-                return { result: 1, isEnded: true };
-              }
+              if (cfg.noAd) { try { return Promise.resolve({ result: 1, isEnded: true, ok: true }); } catch (e) { return { result: 1, isEnded: true }; } }
               return f.apply(window.platform, arguments);
             };
-            window.platform[n].__qyxy_wrapped = true;
+            window.platform[n].__qyxy_w = true;
             S.adWrapped.push("platform." + n);
           }
         });
       }
     } catch (e) {}
   }
-  wrapAdOnce();
+  if (IS_GAME || !IS_TOP) wrapAds();
 
-  /* ---------------- 6. 探针 ---------------- */
+  /* ================= 6. 探针 ================= */
   function probe() {
-    var out = [];
-    out.push("=== QYXY probe " + new Date().toISOString() + " ===");
-    out.push("engine=" + S.engine + "  detail=" + S.engineDetail);
-    out.push("hpKeys=" + JSON.stringify(S.hpKeys));
-    out.push("units=" + S.units + "  adWrapped=" + JSON.stringify(S.adWrapped));
-    out.push("url=" + location.href);
-    out.push("ua=" + navigator.userAgent);
-    try { out.push("globalKeys=" + Object.keys(window).slice(0, 400).join(",")); } catch (e) {}
+    var o = [];
+    o.push("### frame: " + S.href);
+    o.push("  isTop=" + S.isTop + " isGame=" + S.isGame);
+    o.push("  engine=" + S.engine + " laya=" + S.layaVer + " fgui=" + S.fgui);
+    o.push("  title=" + (document.title || ""));
+    try { o.push("  canvas=" + document.querySelectorAll("canvas").length); } catch (e) {}
     try {
-      if (window.cc && cc.director && cc.director.getScene) {
-        var scn = cc.director.getScene();
-        out.push("cc.scene=" + (scn && scn.name));
-        if (scn && scn.children) out.push("cc.scene.children=" + scn.children.map(function (c) { return c.name || (c.__classname__ || "?"); }).join("|"));
+      o.push("  iframes=" + document.querySelectorAll("iframe").length + " -> " +
+        Array.prototype.map.call(document.querySelectorAll("iframe"), function (f) { return (f.src || f.id || "?").slice(0, 120); }).join(" | "));
+    } catch (e) {}
+    // 已加载脚本
+    try {
+      var res = performance.getEntriesByType("resource") || [];
+      var js = [];
+      res.forEach(function (r) { if (/\.js(\?|$)/.test(r.name)) js.push(r.name.split("/").slice(-1)[0] + ":" + Math.round(r.transferSize || 0)); });
+      if (js.length) o.push("  js(" + js.length + ")=" + js.join(" "));
+    } catch (e) {}
+    // Laya 场景树
+    try {
+      if (window.Laya && Laya.stage) {
+        o.push("  Laya.stage numChildren=" + Laya.stage.numChildren +
+               " frameRate=" + Laya.stage.frameRate + " timer.scale=" + (Laya.timer && Laya.timer.scale));
+        var ls = layaScan();
+        o.push("  layaUnits=" + ls.length);
+        ls.slice(0, 12).forEach(function (u) {
+          o.push("    " + u.path + " <" + u.cls + "> hp=[" + u.hp.join(",") + "] atk=[" + u.atk.join(",") + "] keys=[" + u.keys.join(",") + "]");
+        });
       }
     } catch (e) {}
+    // 全局数值对象
     try {
-      if (window.egret && egret.MainContext && egret.MainContext.instance) {
-        var st = egret.MainContext.instance.stage;
-        out.push("egret.stage.children=" + (st && st.$children ? st.$children.length : "?"));
-      }
+      var gs = globalScan();
+      o.push("  globalUnits=" + gs.length);
+      gs.slice(0, 10).forEach(function (u) {
+        o.push("    " + u.name + " <" + u.cls + "> keys=[" + u.keys.join(",") + "]");
+      });
     } catch (e) {}
-    try {
-      if (window.Laya && Laya.stage) out.push("laya.children=" + Laya.stage.numChildren);
-    } catch (e) {}
-    // 采样一个 unit
-    try {
-      var sc = scanForUnits();
-      for (var i = 0; i < sc.arrays.length && i < 3; i++) {
-        var arr = sc.arrays[i][1];
-        if (arr && arr.length) {
-          var o = arr[0];
-          if (o && typeof o === "object") {
-            var ks = [];
-            for (var k in o) if (k !== "parent" && k !== "children") ks.push(k);
-            out.push("sample[" + sc.arrays[i][0] + "][" + (o.__classname__ || typeof o) + "] keys=" + ks.slice(0, 60).join(","));
-          }
-        }
-      }
-    } catch (e) {}
-    out.push("=== end ===");
-    S.notes = out.join("\n");
-    return S.notes;
+    o.push("  speed=" + S.speedApplied + " adWrapped=" + JSON.stringify(S.adWrapped) + " err=" + (S.err || "-"));
+    return o.join("\n");
   }
 
-  /* ---------------- 7. 状态回读（原生每秒调用） ---------------- */
+  /* ================= 7. 跨 frame 消息总线（postMessage 跨域合法） ================= */
+  // 子 frame 把状态上报给父 frame；父 frame 下发配置给所有子 frame。
+  var lastReport = "";
+  function report() {
+    var st = localState();
+    lastReport = st;
+    try {
+      if (!IS_TOP && window.parent && window.parent !== window) {
+        window.parent.postMessage({ __qyxy_report: 1, href: location.href, state: st, probe: window.__qyxy_probe }, "*");
+      }
+    } catch (e) {}
+    return st;
+  }
+  function broadcastCfg(cfg) {
+    try {
+      for (var i = 0; i < window.frames.length; i++) {
+        try { window.frames[i].postMessage({ __qyxy_cfg: cfg }, "*"); } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  try {
+    window.addEventListener("message", function (ev) {
+      var d = ev.data;
+      if (!d || typeof d !== "object") return;
+      if (d.__qyxy_cfg) {                       // 父 frame 下发配置
+        var c = window.__qyxy_cfg || (window.__qyxy_cfg = {});
+        c.god = !!d.__qyxy_cfg.god;
+        c.kill = !!d.__qyxy_cfg.kill;
+        c.noAd = !!d.__qyxy_cfg.noAd;
+        c.speed = d.__qyxy_cfg.speed || 1;
+        if (d.__qyxy_cfg.probe) c.probe = true;
+        broadcastCfg(d.__qyxy_cfg);             // 继续往下传
+      }
+      if (d.__qyxy_report && IS_TOP) {          // 子 frame 上报
+        window.__qyxy_frames = window.__qyxy_frames || {};
+        window.__qyxy_frames[d.href] = { state: d.state, probe: d.probe, t: Date.now() };
+      }
+    }, false);
+  } catch (e) {}
+
+  function aggState() {
+    var lines = [];
+    lines.push(localState());
+    var f = window.__qyxy_frames || {};
+    for (var k in f) if (f[k] && f[k].state) lines.push(f[k].state);
+    return lines.join(" ;; ");
+  }
+  function aggProbe() {
+    var o = [];
+    for (var k in (window.__qyxy_frames || {})) {
+      var fr = window.__qyxy_frames[k];
+      if (fr && fr.probe) o.push(fr.probe);
+    }
+    return o.join("\n\n");
+  }
+
+  /* ================= 8. 状态回读（原生逐 frame 调用） ================= */
+  function localState() {
+    var cfg = window.__qyxy_cfg || {};
+    applyAll();
+    if (cfg.speed > 1.0001 || cfg.speed < 0.9999) applySpeed(cfg.speed);
+    S.units = layaScan().length + globalScan().length;
+    return "href=" + S.href.slice(0, 120) +
+           "|eng=" + S.engine + "|laya=" + S.layaVer +
+           "|game=" + (S.isGame ? 1 : 0) +
+           "|top=" + (S.isTop ? 1 : 0) +
+           "|units=" + S.units +
+           "|spd=" + S.speedApplied +
+           "|god=" + (cfg.god ? 1 : 0) + "|kill=" + (cfg.kill ? 1 : 0) +
+           "|ad=" + S.adWrapped.length + "|err=" + (S.err || "-");
+  }
+
   window.__qyxy_state = function () {
     var cfg = window.__qyxy_cfg || {};
-    applyEachFrame();
     if (cfg.probe) {
       cfg.probe = false;
-      try { return "PROBE::" + probe(); } catch (e) { return "PROBE::ERR " + e; }
+      try { window.__qyxy_probe = probe(); } catch (e) { window.__qyxy_probe = "PROBEERR " + e; }
+      broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: true });
     }
-    return "eng=" + S.engine + "|hp=" + S.hpKeys.length + "|units=" + S.units +
-           "|god=" + (cfg.god ? "1" : "0") + "|kill=" + (cfg.kill ? "1" : "0") +
-           "|ad=" + S.adWrapped.length + "|err=" + (S.lastErr || "-");
+    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: false });
+    var st = aggState();
+    var pr = window.__qyxy_probe || aggProbe();
+    return "QYOK::" + st + (pr ? "\nQYPROBE::\n" + pr : "");
   };
+  if (!IS_TOP) setInterval(report, 700);
 
-  log("installed; engine=" + S.engine + " hpKeys=" + JSON.stringify(S.hpKeys));
-  return window.__qyxy_state();
+  log("installed isTop=" + IS_TOP + " isGame=" + IS_GAME + " engine=" + S.engine + " " + S.layaVer);
+  return localState();
 })();

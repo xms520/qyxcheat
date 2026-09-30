@@ -237,11 +237,17 @@ static void qy_eval(WKWebView *wv, NSString *js, void (^done)(id, NSError *)) {
     });
 }
 
+static NSMutableArray <NSString *> *g_reports = nil;   // 各 frame 状态汇总
+
 static void qy_push_config(void) {
+    NSArray *list = nil;
+    [g_lock lock]; list = [g_webs copy]; [g_lock unlock];
+    if (list.count == 0) { g_lastNote = @"未找到 WebView"; return; }
+
     NSString *js = [NSString stringWithFormat:
-        @"(function(){var c=window.__qyxy_cfg;if(!c)return 'no-inject';"
+        @"(function(){var c=window.__qyxy_cfg;if(!c)return 'QYNOSCRIPT';"
         @"c.god=%@;c.kill=%@;c.noAd=%@;c.speed=%f;c.probe=%@;c.tick=(c.tick||0)+1;"
-        @"return window.__qyxy_state?window.__qyxy_state():'no-state';})()",
+        @"return window.__qyxy_state?window.__qyxy_state():'QYNOSTATE';})()",
         g_god ? @"true" : @"false",
         g_kill ? @"true" : @"false",
         g_noAd ? @"true" : @"false",
@@ -249,24 +255,44 @@ static void qy_push_config(void) {
         g_probeReq ? @"true" : @"false"];
     g_probeReq = NO;
 
-    NSArray *list = nil;
-    [g_lock lock]; list = [g_webs copy]; [g_lock unlock];
     for (WKWebView *wv in list) {
         qy_eval(wv, js, ^(id r, NSError *e) {
-            if ([r isKindOfClass:[NSString class]]) {
-                NSString *s = (NSString *)r;
-                if ([s hasPrefix:@"PROBE::"]) {
-                    NSString *body = [s substringFromIndex:7];
-                    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/qyxy_probe.txt"];
-                    [body writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-                    g_lastNote = @"探针已导出";
-                } else if ([s isEqualToString:@"no-inject"]) {
-                    g_lastNote = @"待注入";
-                } else {
-                    g_lastNote = s.length > 60 ? [s substringToIndex:60] : s;
+            if (![r isKindOfClass:[NSString class]]) {
+                if (e) g_lastNote = [NSString stringWithFormat:@"eval错: %@", e.localizedDescription];
+                return;
+            }
+            NSString *s = (NSString *)r;
+            if (![s hasPrefix:@"QYOK::"]) { g_lastNote = [s substringToIndex:MIN((NSUInteger)70, s.length)]; return; }
+
+            NSString *body = [s substringFromIndex:6];
+            NSRange pr = [body rangeOfString:@"\nQYPROBE::\n"];
+            NSString *state = (pr.location == NSNotFound) ? body : [body substringToIndex:pr.location];
+            NSString *probeTxt = (pr.location == NSNotFound) ? nil : [body substringFromIndex:pr.location + pr.length];
+
+            // 摘要：只显示 game=1 的 frame（真游戏层）
+            NSString *game = @"";
+            for (NSString *line in [state componentsSeparatedByString:@" ;; "]) {
+                if ([line rangeOfString:@"|game=1"].location != NSNotFound) { game = line; break; }
+            }
+            if (game.length == 0) {
+                for (NSString *line in [state componentsSeparatedByString:@" ;; "]) {
+                    if ([line rangeOfString:@"dl-qyxx"].location != NSNotFound) { game = line; break; }
                 }
-            } else if (e) {
-                g_lastNote = @"eval错";
+            }
+            NSArray *parts = [(game.length ? game : state) componentsSeparatedByString:@"|"];
+            NSString *short_ = @"";
+            for (NSString *p in parts) {
+                if ([p hasPrefix:@"eng="] || [p hasPrefix:@"laya="] || [p hasPrefix:@"units="] ||
+                    [p hasPrefix:@"spd="] || [p hasPrefix:@"ad="] || [p hasPrefix:@"err="] || [p hasPrefix:@"game="]) {
+                    short_ = short_.length ? [short_ stringByAppendingFormat:@" %@", p] : p;
+                }
+            }
+            g_lastNote = short_.length ? short_ : @"已注入(未见游戏层)";
+
+            if (probeTxt && probeTxt.length > 20) {
+                NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/qyxy_probe.txt"];
+                [probeTxt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                g_lastNote = @"探针已导出 → qyxy_probe.txt";
             }
         });
     }
@@ -324,14 +350,74 @@ static void qy_swizzle(Class c, SEL a, SEL b) {
     if (m1 && m2) method_exchangeImplementations(m1, m2);
 }
 
+#pragma mark - ★ 核心：WKUserScript 全 frame 注入（唯一能穿透跨域 iframe 的手段）
+// 已实测架构：平台壳(appack.zkyouxi.com) → iframe(SDK壳) → iframe(dl-qyxx.gzdlm.com=游戏)
+// 两层 iframe 均与父页跨域 ⇒ 无法从父页 JS 访问 ⇒ 必须由原生侧 forMainFrameOnly:NO 注入。
+static WKUserScript *g_userScript = nil;
+
+static WKUserScript *qy_user_script(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *src = [NSString stringWithUTF8String:QYXY_JS];
+        // forMainFrameOnly:NO  →  注入到所有 frame，含跨域 iframe（关键参数）
+        g_userScript = [[WKUserScript alloc] initWithSource:src
+                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                           forMainFrameOnly:NO];
+        qlog(@"WKUserScript 就绪 (%lu 字节, forMainFrameOnly=NO)", (unsigned long)src.length);
+    });
+    return g_userScript;
+}
+
+static void qy_install_userscript_on_config(WKWebViewConfiguration *cfg) {
+    if (!cfg) return;
+    @try {
+        WKUserContentController *ucc = cfg.userContentController;
+        if (!ucc) { ucc = [[WKUserContentController alloc] init]; cfg.userContentController = ucc; }
+        WKUserScript *s = qy_user_script();
+        // 去重：避免每次加载重复加
+        BOOL has = NO;
+        for (WKUserScript *e in ucc.userScripts) {
+            if (e.source.length == s.source.length) { has = YES; break; }
+        }
+        if (!has) [ucc addUserScript:s];
+    } @catch (NSException *e) {
+        qlog(@"⚠️ userScript 安装异常: %@", e.reason);
+    }
+}
+
+// hook -[WKWebViewConfiguration copy] 与 setUserContentController:，
+// 保证「已经创建好配置的」WebView 也能拿到脚本
+@interface WKWebViewConfiguration (QYXYHook)
+@end
+@implementation WKWebViewConfiguration (QYXYHook)
+- (id)qyxy_copy {
+    id c = [self qyxy_copy];             // 交换后 = 原 copy
+    qy_install_userscript_on_config((WKWebViewConfiguration *)c);
+    return c;
+}
+@end
+
+@interface WKUserContentController (QYXYHook)
+@end
+@implementation WKUserContentController (QYXYHook)
+- (void)qyxy_addUserScript:(WKUserScript *)s {
+    [self qyxy_addUserScript:s];         // 交换后 = 原实现
+}
+@end
+
 static void qy_hook_webview(void) {
     Class c = objc_getClass("WKWebView");
     if (!c) { qlog(@"⚠️ 未找到 WKWebView 类"); return; }
+
+    // 1) 全 frame 注入（主力）
+    qy_swizzle(objc_getClass("WKWebViewConfiguration"), @selector(copy), @selector(qyxy_copy));
+
+    // 2) 记录 WebView + 兜底注入（部分壳自建 config，不经 copy 路径）
     qy_swizzle(c, @selector(loadRequest:),            @selector(qyxy_loadRequest:));
     qy_swizzle(c, @selector(loadHTMLString:baseURL:), @selector(qyxy_loadHTMLString:baseURL:));
     qy_swizzle(c, @selector(loadFileURL:allowingReadAccessToURL:), @selector(qyxy_loadFileURL:allowingReadAccessToURL:));
     qy_swizzle(c, @selector(loadData:MIMEType:characterEncodingName:baseURL:), @selector(qyxy_loadData:MIMEType:characterEncodingName:baseURL:));
-    qlog(@"WKWebView hook 已装载");
+    qlog(@"WKWebView hook 已装载（userScript + load*）");
 }
 
 #pragma mark - ===================== 面板 =====================
