@@ -815,6 +815,79 @@
     return o;
   }
 
+  // ★ 读关键方法源码 —— 直接看判定逻辑读什么、写什么
+  function dumpMethodSource(clsName, methodNames) {
+    var o = [];
+    var c = window[clsName];
+    if (typeof c !== "function") { o.push("  " + clsName + " = 非类"); return o; }
+    methodNames.forEach(function (m) {
+      var f = null;
+      try { f = c.prototype && c.prototype[m]; } catch (e) {}
+      if (typeof f !== "function") { o.push("  " + clsName + "." + m + " = 不存在"); return; }
+      var s = "";
+      try { s = f.toString(); } catch (e) { s = "<无法读取>"; }
+      o.push("  ★ " + clsName + "." + m + "  (srcLen=" + s.length + ")");
+      o.push("      " + s.replace(/\s+/g, " ").slice(0, 1800));
+    });
+    return o;
+  }
+
+  /* ================= 6e. 判定/伤害方法源码（v2.1） ================= */
+  function dumpBattleLogic() {
+    var o = [];
+    o.push("[ATBEntity 判定与更新]");
+    o.push(dumpMethodSource("ATBEntity",
+      ["isDeath", "checkDeath", "updateLife", "fightEntityData", "updateNuQi", "updateHuDun", "onAttackFrame"]).join("\n"));
+    o.push("\n[MainLevelEntityBase 战斗基类]");
+    o.push(dumpMethodSource("MainLevelEntityBase",
+      ["dealwithAttack", "onAttackFrame", "canFight", "updateEntityData", "frameLoop"]).join("\n"));
+    o.push("\n[MainLevelHeroEntity 我方]");
+    o.push(dumpMethodSource("MainLevelHeroEntity",
+      ["addHurt", "dealwithAttack", "getEnemyData", "isSameSide", "updateEntityData"]).join("\n"));
+    o.push("\n[MainLevelEnemyEntity 敌方]");
+    o.push(dumpMethodSource("MainLevelEnemyEntity",
+      ["addHurt", "dealwithAttack", "getHeroData", "updateEntityData"]).join("\n"));
+    o.push("\n[DisPlayEntity 表现层]");
+    o.push(dumpMethodSource("DisPlayEntity",
+      ["checkDeath", "isDeath", "showHurt", "updateLife", "render"]).join("\n"));
+    return o;
+  }
+
+  // 全局找 MainLevel* 实例（不在显示树，可能挂在别的对象上）
+  function findLogicInstances() {
+    var o = [];
+    var cls = {};
+    ["MainLevelFightManager", "MainLevelEntityData", "MainLevelEntityBase",
+     "MainLevelHeroEntity", "MainLevelEnemyEntity"].forEach(function (n) {
+      if (typeof window[n] === "function") cls[n] = window[n];
+    });
+    var hits = {};
+    var scanned = 0, seen = [];
+    function scan(obj, path, depth) {
+      if (!obj || depth > 3 || scanned > 4000) return;
+      var t = typeof obj;
+      if (t !== "object" && t !== "function") return;
+      if (seen.indexOf(obj) >= 0) return;
+      seen.push(obj); scanned++;
+      for (var n in cls) {
+        try { if (obj instanceof cls[n]) { hits[n] = (hits[n] || 0) + 1; if ((hits[n] || 0) <= 3) o.push("  " + n + " @ " + path); } } catch (e) {}
+      }
+      if (depth >= 3) return;
+      var ks = [];
+      try { ks = Object.keys(obj); } catch (e) { return; }
+      for (var i = 0; i < ks.length && i < 120; i++) {
+        var k = ks[i];
+        if (/^(top|parent|self|window|document|location|frames|_children|__)/.test(k)) continue;
+        var v; try { v = obj[k]; } catch (e) { continue; }
+        if (!v || (typeof v !== "object" && typeof v !== "function")) continue;
+        scan(v, path + "." + k, depth + 1);
+      }
+    }
+    try { scan(window, "window", 0); } catch (e) { o.push("  scanERR " + e); }
+    o.unshift("  扫描对象数=" + scanned + "  命中=" + JSON.stringify(hits));
+    return o;
+  }
+
   /* ================= 7b. 同源 iframe 递归走访（appack 平台壳可直达 SDK 壳） ================= */
   function walkSameOrigin(w, tag, depth, out) {
     if (!w || depth > 4) return;
@@ -901,6 +974,12 @@
       o.push("  units=" + S.units + " speed=" + S.speedApplied + " ad=" + JSON.stringify(S.adWrapped));
       // ★ 游戏帧专属深挖
       if (S.isGame) {
+        o.push("\n--- ★★★ 判定/伤害方法源码（钩点逻辑） ---");
+        o.push(dumpBattleLogic().join("\n"));
+
+        o.push("\n--- ★★ MainLevel* 逻辑实例全局定位 ---");
+        o.push(findLogicInstances().join("\n"));
+
         o.push("\n--- ★★★ 战斗引擎类原型方法（钩点定位） ---");
         ["MainLevelFightManager", "MainLevelEntityData", "MainLevelEntityBase", "MainLevelHeroEntity",
          "MainLevelEnemyEntity", "ATBEntity", "DisPlayEntity", "GameSceneATB", "GameMapATB",
@@ -910,20 +989,14 @@
           o.push("  " + protoMethods(n));
         });
 
-        o.push("\n--- ★★ 场景类清单（战斗引擎在哪一层） ---");
+        o.push("\n--- ★★ 场景类清单 ---");
         o.push("  " + sceneClassInventory());
-
-        o.push("\n--- ★★ ATBEntity 节点全键 + 原型方法 ---");
-        o.push(dumpEntityNodeFull().join("\n"));
 
         o.push("\n--- ★★ fightAttrs / totalAttr 真实内容 ---");
         o.push(dumpFightAttr().join("\n"));
 
-        o.push("\n--- 战斗引擎实例定位（显示树上） ---");
-        ["MainLevelFightManager", "MainLevelEntityData", "ATBEntity", "GameSceneATB", "GameMapATB"].forEach(function (n) {
-          var r = findInstances(n, 10);
-          o.push("  " + n + " 实例数=" + r.length + (r.length ? " -> " + r.slice(0, 6).join(" | ") : ""));
-        });
+        o.push("\n--- ATBEntity 节点全键 + 原型方法 ---");
+        o.push(dumpEntityNodeFull().join("\n"));
 
         o.push("\n--- 序列化器静态字段表 propertys ---");
         o.push(dumpPropertys().join("\n"));
