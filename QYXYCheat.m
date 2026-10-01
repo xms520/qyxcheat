@@ -62,8 +62,10 @@ static void qlog(NSString *fmt, ...) {
 }
 
 #pragma mark - ===================== 全局配置 =====================
-static BOOL   g_god        = NO;    // 无敌
-static BOOL   g_kill       = NO;    // 秒杀（持续压制敌方血量）
+static BOOL   g_god        = NO;    // 无敌（我方 curLife 拉满 + 护盾拉满）
+static BOOL   g_kill       = NO;    // 秒杀（敌方 curLife/hudun 清 0）
+static BOOL   g_atkup      = NO;    // 增伤（己方 attack 拉满 + miaoshaRate=100）
+static BOOL   g_nuqi       = NO;    // 满怒气
 static double g_speed      = 1.0;   // 加速倍数
 static BOOL   g_noAd       = NO;    // 免广告
 static BOOL   g_probeReq   = NO;    // 探针请求
@@ -246,11 +248,13 @@ static void qy_push_config(void) {
 
     NSString *js = [NSString stringWithFormat:
         @"(function(){var c=window.__qyxy_cfg;if(!c)return 'QYNOSCRIPT';"
-        @"c.god=%@;c.kill=%@;c.noAd=%@;c.speed=%f;c.probe=%@;c.tick=(c.tick||0)+1;"
+        @"c.god=%@;c.kill=%@;c.noAd=%@;c.atkup=%@;c.nuqi=%@;c.speed=%f;c.probe=%@;c.tick=(c.tick||0)+1;"
         @"return window.__qyxy_state?window.__qyxy_state():'QYNOSTATE';})()",
         g_god ? @"true" : @"false",
         g_kill ? @"true" : @"false",
         g_noAd ? @"true" : @"false",
+        g_atkup ? @"true" : @"false",
+        g_nuqi ? @"true" : @"false",
         g_speed,
         g_probeReq ? @"true" : @"false"];
     g_probeReq = NO;
@@ -444,7 +448,7 @@ static void qy_hook_webview(void) {
 
 #pragma mark - ===================== 面板 =====================
 static UILabel *g_note = nil;
-static UIButton *g_btnGod = nil, *g_btnKill = nil, *g_btnSpeed = nil, *g_btnAd = nil;
+static UIButton *g_btnGod = nil, *g_btnKill = nil, *g_btnAtk = nil, *g_btnNuqi = nil, *g_btnSpeed = nil, *g_btnAd = nil;
 
 static UIButton *qy_mkbtn(NSString *title, UIColor *bg) {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -463,7 +467,8 @@ static UIButton *qy_mkbtn(NSString *title, UIColor *bg) {
 - (void)ballTap;
 - (void)ballDrag:(UIPanGestureRecognizer *)g;
 - (void)panelDrag:(UIPanGestureRecognizer *)g;
-- (void)toggleGod;  - (void)toggleKill;  - (void)cycleSpeed;
+- (void)toggleGod;  - (void)toggleKill;  - (void)toggleAtk;  - (void)toggleNuqi;
+- (void)cycleSpeed;
 - (void)toggleAd;   - (void)doProbe;     - (void)closePanel;
 - (void)refreshUI;  - (void)tick;
 @end
@@ -475,6 +480,8 @@ static UIButton *qy_mkbtn(NSString *title, UIColor *bg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_btnGod)   [g_btnGod   setTitle:(g_god   ? @"无敌 ✅" : @"无敌 ⭕️") forState:UIControlStateNormal];
         if (g_btnKill)  [g_btnKill  setTitle:(g_kill  ? @"秒杀 ✅" : @"秒杀 ⭕️") forState:UIControlStateNormal];
+        if (g_btnAtk)   [g_btnAtk   setTitle:(g_atkup ? @"增伤 ✅" : @"增伤 ⭕️") forState:UIControlStateNormal];
+        if (g_btnNuqi)  [g_btnNuqi  setTitle:(g_nuqi  ? @"满怒 ✅" : @"满怒 ⭕️") forState:UIControlStateNormal];
         if (g_btnAd)    [g_btnAd    setTitle:(g_noAd  ? @"免广 ✅" : @"免广 ⭕️") forState:UIControlStateNormal];
         if (g_btnSpeed) [g_btnSpeed setTitle:[NSString stringWithFormat:@"加速 ×%.0f", g_speed] forState:UIControlStateNormal];
         if (g_note)     g_note.text = g_lastNote;
@@ -483,6 +490,8 @@ static UIButton *qy_mkbtn(NSString *title, UIColor *bg) {
 
 - (void)toggleGod  { g_god  = !g_god;  [self refreshUI]; }
 - (void)toggleKill { g_kill = !g_kill; [self refreshUI]; }
+- (void)toggleAtk  { g_atkup = !g_atkup; [self refreshUI]; }
+- (void)toggleNuqi { g_nuqi = !g_nuqi; [self refreshUI]; }
 - (void)toggleAd   { g_noAd = !g_noAd; [self refreshUI]; }
 - (void)cycleSpeed {
     double seq[] = {1.0, 2.0, 3.0, 5.0, 8.0};
@@ -497,7 +506,7 @@ static UIButton *qy_mkbtn(NSString *title, UIColor *bg) {
 
 - (void)togglePanel {
     if (g_panel) { [self closePanel]; return; }
-    CGFloat pw = 262, ph = 400;
+    CGFloat pw = 262, ph = 442;
     UIView *root = g_win.rootViewController.view;
     CGFloat bx = g_ball.center.x, by = g_ball.center.y;
     CGFloat px = bx + BALL_SIZE/2 + 8, py = by - ph/2.0;
@@ -531,16 +540,19 @@ static UIButton *qy_mkbtn(NSString *title, UIColor *bg) {
 
     g_btnGod   = qy_mkbtn(@"无敌 ⭕️", qy_c(38, 44, 62, 1));
     g_btnKill  = qy_mkbtn(@"秒杀 ⭕️", qy_c(38, 44, 62, 1));
+    g_btnAtk   = qy_mkbtn(@"增伤 ⭕️", qy_c(38, 44, 62, 1));
+    g_btnNuqi  = qy_mkbtn(@"满怒 ⭕️", qy_c(38, 44, 62, 1));
     g_btnSpeed = qy_mkbtn(@"加速 ×1",  qy_c(38, 44, 62, 1));
     g_btnAd    = qy_mkbtn(@"免广 ⭕️", qy_c(38, 44, 62, 1));
     UIButton *bProbe = qy_mkbtn(@"JS探针", qy_c(52, 40, 66, 1));
     UIButton *bHide  = qy_mkbtn(@"收起面板", qy_c(30, 36, 52, 1));
 
     NSArray *row1 = @[g_btnGod, g_btnKill];
-    NSArray *row2 = @[g_btnSpeed, g_btnAd];
-    NSArray *row3 = @[bProbe, bHide];
+    NSArray *row2 = @[g_btnAtk, g_btnNuqi];
+    NSArray *row3 = @[g_btnSpeed, g_btnAd];
+    NSArray *row4 = @[bProbe, bHide];
     CGFloat y = 62;
-    for (NSArray *row in @[row1, row2, row3]) {
+    for (NSArray *row in @[row1, row2, row3, row4]) {
         CGFloat x0 = 14;
         for (UIButton *b in row) {
             b.frame = CGRectMake(x0, y, 112, 34);
@@ -551,6 +563,8 @@ static UIButton *qy_mkbtn(NSString *title, UIColor *bg) {
     }
     [g_btnGod   addTarget:self action:@selector(toggleGod)   forControlEvents:UIControlEventTouchUpInside];
     [g_btnKill  addTarget:self action:@selector(toggleKill)  forControlEvents:UIControlEventTouchUpInside];
+    [g_btnAtk   addTarget:self action:@selector(toggleAtk)   forControlEvents:UIControlEventTouchUpInside];
+    [g_btnNuqi  addTarget:self action:@selector(toggleNuqi)  forControlEvents:UIControlEventTouchUpInside];
     [g_btnSpeed addTarget:self action:@selector(cycleSpeed)  forControlEvents:UIControlEventTouchUpInside];
     [g_btnAd    addTarget:self action:@selector(toggleAd)    forControlEvents:UIControlEventTouchUpInside];
     [bProbe     addTarget:self action:@selector(doProbe)     forControlEvents:UIControlEventTouchUpInside];

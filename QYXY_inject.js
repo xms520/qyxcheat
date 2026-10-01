@@ -31,7 +31,12 @@
     probe: ""
   };
 
-  window.__qyxy_cfg = { god: false, kill: false, noAd: false, speed: 1.0, probe: false, tick: 0 };
+  // god   = 无敌（我方 curLife 持续拉满 + 护盾拉满）
+  // kill  = 秒杀（敌方 curLife/hudun 清 0）
+  // atkup = 增伤（我方 fightAttrs.attack 拉满 + miaoshaRate=100）
+  // nuqi  = 满怒气（我方 nuqi=maxNuqi）
+  window.__qyxy_cfg = { god: false, kill: false, noAd: false, atkup: false, nuqi: false,
+                        speed: 1.0, probe: false, tick: 0 };
   window.__qyxy_probe = "";
 
   function log(s) { try { console.log("[QYXY] " + s); } catch (e) {} }
@@ -179,46 +184,106 @@
     return acc;
   }
 
-  /* ================= 4. 应用：无敌 / 秒杀 ================= */
-  function applyToUnit(o, cfg) {
+  /* ================= 4. 应用：无敌 / 秒杀（基于实测字段名） ================= */
+  // 实测字段（xms520/qyxcheat v1.8 探针确认）：
+  //   entityData.maxLife / curLife      = 血量
+  //   entityData.hudun / hudunNum       = 护盾
+  //   entityData.nuqi / maxNuqi         = 怒气
+  //   entityData.isEnemy                = 是否敌方  ★ 敌我判定的关键
+  //   entityData.force                  = 阵营 (1=己方 2=敌方)
+  //   entityData.fightAttrs             = SFightAttrs 实例（含 attack/defence/miaoshaRate...）
+  var BIG = 999999999;
+
+  function applyToEntityData(d, cfg) {
+    if (!d || typeof d !== "object") return;
     try {
-      var ks = Object.keys(o);
-      var hpK = null, maxK = null;
-      for (var i = 0; i < ks.length; i++) {
-        if (HP_PAT.test(ks[i])) { hpK = ks[i]; break; }
+      var isEnemy = false;
+      if (typeof d.isEnemy === "boolean") isEnemy = d.isEnemy;
+      else if (typeof d.force === "number") isEnemy = (d.force !== 1);   // force=1 视为己方
+
+      if (cfg.kill && isEnemy) {
+        // ① 血清零
+        if (typeof d.curLife === "number") d.curLife = 0;
+        if (typeof d.hudun === "number") d.hudun = 0;          // 破盾
+        if (typeof d.hudunNum === "number") d.hudunNum = 0;
+        // ② 属性直接削（若存在 fightAttrs，把防御与生命压到最低）
+        try {
+          var fa = d.fightAttrs;
+          if (fa) {
+            if (fa.attrs) { /* map<attrId,val> 由下方 attack 增强处理 */ }
+            if (typeof fa.defence === "number") fa.defence = 0;
+            if (typeof fa.life === "number") fa.life = 0;
+          }
+          var ta = d.totalAttr;
+          if (ta && typeof ta.life === "number") ta.life = 0;
+        } catch (e) {}
+        S.kills++;
       }
-      for (var j = 0; j < ks.length; j++) {
-        if (MAXH_PAT.test(ks[j])) { maxK = ks[j]; break; }
-      }
-      if (cfg.god) {
-        if (hpK && maxK && typeof o[maxK] === "number") {
-          if (o[hpK] !== o[maxK]) { o[hpK] = o[maxK]; S.godHits++; }
-        } else if (hpK && typeof o[hpK] === "number") {
-          var snap = "__qyxy_hp0";
-          if (o[snap] === undefined) o[snap] = o[hpK];
-          if (o[hpK] < o[snap]) { o[hpK] = o[snap]; S.godHits++; }
+
+      if (cfg.god && !isEnemy) {
+        // ① 血量持续拉满
+        if (typeof d.maxLife === "number" && typeof d.curLife === "number") {
+          if (d.curLife < d.maxLife) { d.curLife = d.maxLife; S.godHits++; }
         }
+        // ② 记录初始血量并抬到极大，防止被一击超杀
+        if (typeof d.maxLife === "number" && d.maxLife < BIG) {
+          if (d.__qyxy_ml === undefined) d.__qyxy_ml = d.maxLife;
+          if (d.maxLife < BIG && cfg.god) { /* 保守：不直接改 maxLife，避免 UI 异常 */ }
+        }
+        // ③ 护盾拉满
+        if (typeof d.hudun === "number" && d.hudun < BIG) d.hudun = BIG;
+        if (typeof d.hudunNum === "number" && d.hudunNum < BIG) d.hudunNum = BIG;
       }
-      if (cfg.kill) {
-        if (hpK && typeof o[hpK] === "number" && o[hpK] > 0) { o[hpK] = 0; S.kills++; }
+
+      if (cfg.noanger === false) { /* 占位 */ }
+      if (cfg.nuqi && !isEnemy) {
+        if (typeof d.maxNuqi === "number" && typeof d.nuqi === "number") d.nuqi = d.maxNuqi;
+      }
+      // ④ 我方属性增强（攻击拉满 = 变相秒杀，且更可能被服务端接受）
+      if (cfg.atkup && !isEnemy) {
+        try {
+          var fa2 = d.fightAttrs;
+          if (fa2 && typeof fa2.attack === "number" && fa2.attack < BIG) fa2.attack = BIG;
+          if (fa2 && typeof fa2.miaoshaRate === "number" && fa2.miaoshaRate < 100) fa2.miaoshaRate = 100;  // ★ 游戏自带秒杀率
+        } catch (e) {}
       }
     } catch (e) { S.err = "" + e; }
   }
 
+  // 旧版通用兜底（非 ATB 场景）
+  function applyToUnit(o, cfg) {
+    try {
+      var ks = Object.keys(o), hpK = null, maxK = null;
+      for (var i = 0; i < ks.length; i++) if (HP_PAT.test(ks[i])) { hpK = ks[i]; break; }
+      for (var j = 0; j < ks.length; j++) if (MAXH_PAT.test(ks[j])) { maxK = ks[j]; break; }
+      if (cfg.god && hpK) {
+        if (maxK && typeof o[maxK] === "number") { if (o[hpK] !== o[maxK]) { o[hpK] = o[maxK]; S.godHits++; } }
+      }
+      if (cfg.kill && hpK && typeof o[hpK] === "number" && o[hpK] > 0) { o[hpK] = 0; S.kills++; }
+    } catch (e) {}
+  }
+
   function applyAll() {
     var cfg = window.__qyxy_cfg || {};
-    if (!cfg.god && !cfg.kill) return;
-    var ls = layaScan(), gs = globalScan();
-    S.units = ls.length + gs.length;
-    ls.forEach(function (u) { if (u.obj) applyToUnit(u.obj, cfg); });
-    gs.forEach(function (u) {
-      if (u.obj) applyToUnit(u.obj, cfg);
-      else if (u.arr) {
-        for (var i = 0; i < Math.min(u.arr.length, 200); i++) {
-          if (u.arr[i] && typeof u.arr[i] === "object") applyToUnit(u.arr[i], cfg);
-        }
-      }
-    });
+    if (!cfg.god && !cfg.kill && !cfg.nuqi && !cfg.atkup) return;
+    // 主路径：ATBEntity.entityData（实测确认的结构）
+    var ents = collectATBEntities();
+    S.units = ents.length;
+    for (var i = 0; i < ents.length; i++) {
+      var ed = null;
+      try { ed = ents[i].node.entityData; } catch (e) {}
+      if (ed) applyToEntityData(ed, cfg);
+    }
+    // 兜底：全局数组/对象
+    if (ents.length === 0) {
+      var gs = globalScan();
+      S.units = gs.length;
+      gs.forEach(function (u) {
+        if (u.obj) applyToUnit(u.obj, cfg);
+        else if (u.arr) for (var m = 0; m < Math.min(u.arr.length, 200); m++)
+          if (u.arr[m] && typeof u.arr[m] === "object") applyToUnit(u.arr[m], cfg);
+      });
+    }
   }
 
   /* ================= 5. 免广告 ================= */
@@ -381,6 +446,8 @@
         c.god = !!d.__qyxy_cfg.god;
         c.kill = !!d.__qyxy_cfg.kill;
         c.noAd = !!d.__qyxy_cfg.noAd;
+        c.atkup = !!d.__qyxy_cfg.atkup;
+        c.nuqi = !!d.__qyxy_cfg.nuqi;
         c.speed = d.__qyxy_cfg.speed || 1;
         if (d.__qyxy_cfg.probe) c.probe = true;
         broadcastCfg(d.__qyxy_cfg);
@@ -701,15 +768,22 @@
     var cfg = window.__qyxy_cfg || {};
     applyAll();
     if (cfg.speed > 1.0001 || cfg.speed < 0.9999) applySpeed(cfg.speed);
-    S.units = layaScan().length + globalScan().length;
     maybeProbe();                 // ★ 子帧也要能生成探针（此前只有顶层 __qyxy_state 处理 probe）
-    return "href=" + S.href.slice(0, 130) +
+    var ents = collectATBEntities();
+    S.units = ents.length;
+    var hp = "";
+    if (ents.length) {
+      var e0 = null; try { e0 = ents[0].node.entityData; } catch (e) {}
+      if (e0 && typeof e0.curLife === "number") hp = e0.curLife + "/" + e0.maxLife;
+    }
+    return "href=" + S.href.slice(0, 90) +
            "|eng=" + S.engine + "|laya=" + S.layaVer +
            "|game=" + (S.isGame ? 1 : 0) +
-           "|top=" + (S.isTop ? 1 : 0) +
            "|units=" + S.units +
+           "|hp=" + (hp || "-") +
            "|spd=" + S.speedApplied +
            "|god=" + (cfg.god ? 1 : 0) + "|kill=" + (cfg.kill ? 1 : 0) +
+           "|atk=" + (cfg.atkup ? 1 : 0) + "|nuqi=" + (cfg.nuqi ? 1 : 0) +
            "|ad=" + S.adWrapped.length + "|err=" + (S.err || "-");
   }
 
@@ -774,8 +848,8 @@
     var st = localState();                                   // 内部会处理 probe（含递归走访）
     var pr = window.__qyxy_probe || aggProbe();
     // 让子帧生成各自探针
-    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: true });
-    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, speed: cfg.speed, probe: false });
+    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, atkup: cfg.atkup, nuqi: cfg.nuqi, speed: cfg.speed, probe: true });
+    broadcastCfg({ god: cfg.god, kill: cfg.kill, noAd: cfg.noAd, atkup: cfg.atkup, nuqi: cfg.nuqi, speed: cfg.speed, probe: false });
     return "QYOK::" + st + (pr ? "\nQYPROBE::\n" + pr : "");
   };
   if (!IS_TOP) {
