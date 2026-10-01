@@ -184,73 +184,75 @@
     return acc;
   }
 
-  /* ================= 4. 应用：无敌 / 秒杀（基于实测字段名） ================= */
-  // 实测字段（xms520/qyxcheat v1.8 探针确认）：
-  //   entityData.maxLife / curLife      = 血量
-  //   entityData.hudun / hudunNum       = 护盾
-  //   entityData.nuqi / maxNuqi         = 怒气
-  //   entityData.isEnemy                = 是否敌方  ★ 敌我判定的关键
-  //   entityData.force                  = 阵营 (1=己方 2=敌方)
-  //   entityData.fightAttrs             = SFightAttrs 实例（含 attack/defence/miaoshaRate...）
+  /* ================= 4. 应用：无敌 / 秒杀（v2.2 基于判定源码） =================
+   * 依据 MainLevelEnemyEntity.addHurt 源码（实测）：
+   *   function addHurt(e,t,i){ if(this.entityData){ ... if(i>0){
+   *       this.entityData.life--;                                  // ★ 血量判定字段 = life
+   *       if(this.entityData.life<=0){ this.setActionName(D.Dead) } // ★ 死亡判定读 life
+   *   }}}
+   * 依据 MainLevelHeroEntity.dealwithAttack 源码（实测）：
+   *   e.addHurt(hitModel, attackSound, this.entityData.attack)     // ★ 真实攻击力 = entityData.attack
+   * 依据 MainLevelHeroEntity.getEnemyData 源码（实测）：
+   *   if(!i || i.entityData.life<=0){ ...选新目标... }             // ★ 用 life 判死活
+   * ⇒ 血条读 curLife/maxLife；战斗判定读 life / attack  ★两者不同！
+   */
   var BIG = 999999999;
+
+  function mgr() {
+    try { if (window.hi && window.hi.enemyMap) return window.hi; } catch (e) {}
+    try {
+      for (var k in window) {
+        if (/^(on|webkit|__)/.test(k)) continue;
+        var v; try { v = window[k]; } catch (e) { continue; }
+        if (v && typeof v === "object" && v.enemyMap && v.heroMap) return v;
+      }
+    } catch (e) {}
+    return null;
+  }
 
   function applyToEntityData(d, cfg) {
     if (!d || typeof d !== "object") return;
     try {
       var isEnemy = false;
       if (typeof d.isEnemy === "boolean") isEnemy = d.isEnemy;
-      else if (typeof d.force === "number") isEnemy = (d.force !== 1);   // force=1 视为己方
+      else if (typeof d.force === "number") isEnemy = (d.force !== 1);
 
       if (cfg.kill && isEnemy) {
-        // ① 血清零
-        if (typeof d.curLife === "number") d.curLife = 0;
-        if (typeof d.hudun === "number") d.hudun = 0;          // 破盾
+        // ★ 判定字段：life（不是 curLife）
+        if (typeof d.life === "number") d.life = 0;
+        if (typeof d.curLife === "number") d.curLife = 0;      // 血条同步
+        if (typeof d.hudun === "number") d.hudun = 0;
         if (typeof d.hudunNum === "number") d.hudunNum = 0;
-        // ② 属性直接削（若存在 fightAttrs，把防御与生命压到最低）
-        try {
-          var fa = d.fightAttrs;
-          if (fa) {
-            if (fa.attrs) { /* map<attrId,val> 由下方 attack 增强处理 */ }
-            if (typeof fa.defence === "number") fa.defence = 0;
-            if (typeof fa.life === "number") fa.life = 0;
-          }
-          var ta = d.totalAttr;
-          if (ta && typeof ta.life === "number") ta.life = 0;
-        } catch (e) {}
         S.kills++;
       }
 
       if (cfg.god && !isEnemy) {
-        // ① 血量持续拉满
-        if (typeof d.maxLife === "number" && typeof d.curLife === "number") {
-          if (d.curLife < d.maxLife) { d.curLife = d.maxLife; S.godHits++; }
+        // 判定血量拉满
+        if (typeof d.life === "number") d.life = BIG;
+        if (typeof d.maxLife === "number") {
+          if (d.curLife !== d.maxLife) d.curLife = d.maxLife;
         }
-        // ② 记录初始血量并抬到极大，防止被一击超杀
-        if (typeof d.maxLife === "number" && d.maxLife < BIG) {
-          if (d.__qyxy_ml === undefined) d.__qyxy_ml = d.maxLife;
-          if (d.maxLife < BIG && cfg.god) { /* 保守：不直接改 maxLife，避免 UI 异常 */ }
-        }
-        // ③ 护盾拉满
-        if (typeof d.hudun === "number" && d.hudun < BIG) d.hudun = BIG;
-        if (typeof d.hudunNum === "number" && d.hudunNum < BIG) d.hudunNum = BIG;
+        if (typeof d.hudun === "number") d.hudun = BIG;
+        if (typeof d.hudunNum === "number") d.hudunNum = BIG;
+        S.godHits++;
       }
 
-      if (cfg.noanger === false) { /* 占位 */ }
+      // ★ 增伤：真实攻击力字段 = entityData.attack
+      if (cfg.atkup && !isEnemy) {
+        if (typeof d.attack === "number" && d.attack < BIG) d.attack = BIG;
+        // 同步 totalAttr（部分结算可能读它）
+        try {
+          if (d.totalAttr && typeof d.totalAttr.attack === "number") d.totalAttr.attack = BIG;
+          if (d.totalAttr && typeof d.totalAttr.miaoshaRate === "number") d.totalAttr.miaoshaRate = 100;
+        } catch (e) {}
+      }
+
       if (cfg.nuqi && !isEnemy) {
         if (typeof d.maxNuqi === "number" && typeof d.nuqi === "number") d.nuqi = d.maxNuqi;
-      }
-      // ④ 我方属性增强（攻击拉满 = 变相秒杀，且更可能被服务端接受）
-      if (cfg.atkup && !isEnemy) {
-        try {
-          var fa2 = d.fightAttrs;
-          if (fa2 && typeof fa2.attack === "number" && fa2.attack < BIG) fa2.attack = BIG;
-          if (fa2 && typeof fa2.miaoshaRate === "number" && fa2.miaoshaRate < 100) fa2.miaoshaRate = 100;  // ★ 游戏自带秒杀率
-        } catch (e) {}
       }
     } catch (e) { S.err = "" + e; }
   }
 
-  // 旧版通用兜底（非 ATB 场景）
   function applyToUnit(o, cfg) {
     try {
       var ks = Object.keys(o), hpK = null, maxK = null;
@@ -266,30 +268,40 @@
   function applyAll() {
     var cfg = window.__qyxy_cfg || {};
     if (!cfg.god && !cfg.kill && !cfg.nuqi && !cfg.atkup) return;
-    var ents = collectATBEntities();
-    S.units = ents.length;
     var wlog = [];
-    for (var i = 0; i < ents.length; i++) {
-      var ed = null;
-      try { ed = ents[i].node.entityData; } catch (e) {}
-      if (!ed) continue;
-      var before = { cur: ed.curLife, max: ed.maxLife, nuqi: ed.nuqi, atk: (ed.fightAttrs && ed.fightAttrs.attack) };
-      applyToEntityData(ed, cfg);
-      // ★ 写入后回读：对象属性 setter 可能拦截（游戏常把数据设为只读/计算属性）
-      var after = { cur: ed.curLife, max: ed.maxLife, nuqi: ed.nuqi, atk: (ed.fightAttrs && ed.fightAttrs.attack) };
-      var ok = (before.cur !== after.cur) || (before.nuqi !== after.nuqi) || (before.atk !== after.atk);
-      if (cfg.kill && ed.isEnemy && before.cur === after.cur && before.cur > 0) {
-        wlog.push("写curLife失败(仍=" + after.cur + ")");
+    var M = mgr();
+    var n = 0;
+    if (M) {
+      ["enemyMap", "heroMap"].forEach(function (mk) {
+        var m = null; try { m = M[mk]; } catch (e) {}
+        if (!m) return;
+        for (var k in m) {
+          var e = m[k];
+          if (!e) continue;
+          var d = null; try { d = e.entityData; } catch (x) {}
+          if (!d) continue;
+          n++;
+          var bLife = d.life, bAtk = d.attack, bNuqi = d.nuqi;
+          applyToEntityData(d, cfg);
+          if (cfg.kill && d.isEnemy && bLife === d.life && bLife > 0) wlog.push("life写失败(" + bLife + ")");
+          if (cfg.atkup && !d.isEnemy && bAtk === d.attack && (d.attack || 0) < 1e8) wlog.push("attack写失败(" + bAtk + ")");
+          if (cfg.nuqi && !d.isEnemy && bNuqi === d.nuqi) wlog.push("nuqi写失败(" + bNuqi + ")");
+        }
+      });
+    }
+    // 兜底：显示树 ATBEntity.entityData（无管理器时）
+    if (n === 0) {
+      var ents = collectATBEntities();
+      S.units = ents.length;
+      for (var i = 0; i < ents.length; i++) {
+        var ed = null; try { ed = ents[i].node.entityData; } catch (e) {}
+        if (ed) applyToEntityData(ed, cfg);
       }
-      if (cfg.atkup && !ed.isEnemy && before.atk === after.atk && (after.atk || 0) < 1e8) {
-        wlog.push("写attack失败(仍=" + after.atk + ")");
-      }
-      if (cfg.nuqi && !ed.isEnemy && before.nuqi === after.nuqi) {
-        wlog.push("写nuqi失败(仍=" + after.nuqi + "/" + after.max + ")");
-      }
-      void ok;
+    } else {
+      S.units = n;
     }
     if (wlog.length) S.err = wlog.slice(0, 3).join(";");
+    else if (S.err && /写.*失败/.test(S.err)) S.err = "";
   }
 
   /* ================= 5. 免广告 ================= */
@@ -888,6 +900,76 @@
     return o;
   }
 
+  /* ================= 6f. 战斗管理器定位（v2.2） ================= */
+  // 从源码确认：全局短名 hi = 战斗管理器（enemyMap/heroMap/getEnemyEntity/showFlyText）
+  function findBattleMgr() {
+    var cands = [];
+    // 直接短名
+    ["hi", "Me", "D", "tt", "U", "Y", "Ie", "A", "di", "G"].forEach(function (n) {
+      try { if (window[n] !== undefined) cands.push(n); } catch (e) {}
+    });
+    // 特征匹配：含 enemyMap + heroMap 的对象
+    var found = null, foundName = null;
+    try {
+      for (var k in window) {
+        if (/^(on|webkit|__)/.test(k)) continue;
+        var v; try { v = window[k]; } catch (e) { continue; }
+        if (!v || typeof v !== "object") continue;
+        if (v.enemyMap && v.heroMap) { found = v; foundName = k; break; }
+      }
+    } catch (e) {}
+    return { shortNames: cands, mgr: found, mgrName: foundName };
+  }
+
+  function dumpBattleMgr() {
+    var o = [];
+    var r = findBattleMgr();
+    o.push("  可达短名: " + (r.shortNames.join(",") || "无"));
+    o.push("  特征匹配管理器: " + (r.mgrName || "未找到"));
+
+    var M = r.mgr || window[r.mgrName];
+    if (!M) {
+      // 退一步：试 window.hi
+      try { M = window.hi; } catch (e) {}
+    }
+    if (!M) { o.push("  ⚠️ 无法取得战斗管理器"); return o; }
+
+    o.push("  管理器键: " + (function () { try { return Object.keys(M).join(","); } catch (e) { return "ERR"; } })());
+    ["enemyMap", "heroMap"].forEach(function (mk) {
+      var m = null; try { m = M[mk]; } catch (e) {}
+      if (!m) { o.push("  " + mk + " 不存在"); return; }
+      var ks = [];
+      try { ks = Object.keys(m); } catch (e) {}
+      o.push("  " + mk + " 键数=" + ks.length + " -> " + ks.join(","));
+      ks.slice(0, 6).forEach(function (k) {
+        var e = m[k];
+        if (!e) return;
+        var cn = "?"; try { cn = (e.constructor && e.constructor.name) || "?"; } catch (x) {}
+        o.push("    [" + k + "] <" + cn + ">");
+        var ed = null; try { ed = e.entityData; } catch (x) {}
+        if (ed) {
+          o.push("      entityData 全键: " + (function () { try { return Object.keys(ed).join(","); } catch (x) { return "ERR"; } })());
+          o.push("      关键值: life=" + ed.life + " attack=" + ed.attack + " id=" + ed.id +
+                 " curLife=" + ed.curLife + "/" + ed.maxLife + " force=" + ed.force +
+                 " isEnemy=" + ed.isEnemy + " posIndex=" + ed.posIndex + " nuqi=" + ed.nuqi + "/" + ed.maxNuqi);
+          o.push("      全量 dump:\n        " + dumpObj(ed, 80));
+        } else o.push("      entityData = " + ed);
+        // 节点自身的关键字段
+        o.push("      节点: _actionName=" + (e._actionName || e.actionName) + " x=" + e.x + " y=" + e.y);
+      });
+    });
+    // 动作枚举
+    try {
+      var D = window.D;
+      if (D) {
+        o.push("  D(动作枚举) 键: " + Object.keys(D).slice(0, 40).join(","));
+        if (D.Dead) o.push("    D.Dead = " + JSON.stringify(D.Dead));
+        if (D.isAttackAction) o.push("    D.isAttackAction = fn");
+      } else o.push("  window.D 不可达");
+    } catch (e) {}
+    return o;
+  }
+
   /* ================= 7b. 同源 iframe 递归走访（appack 平台壳可直达 SDK 壳） ================= */
   function walkSameOrigin(w, tag, depth, out) {
     if (!w || depth > 4) return;
@@ -936,13 +1018,30 @@
     applyAll();
     if (cfg.speed > 1.0001 || cfg.speed < 0.9999) applySpeed(cfg.speed);
     maybeProbe();                 // ★ 子帧也要能生成探针（此前只有顶层 __qyxy_state 处理 probe）
-    var ents = collectATBEntities();
-    S.units = ents.length;
-    var hp = "";
-    if (ents.length) {
-      var e0 = null; try { e0 = ents[0].node.entityData; } catch (e) {}
-      if (e0 && typeof e0.curLife === "number") hp = e0.curLife + "/" + e0.maxLife;
+    var hp = "", uN = 0;
+    var M = mgr();
+    if (M) {
+      ["enemyMap", "heroMap"].forEach(function (mk) {
+        var m = null; try { m = M[mk]; } catch (e) {}
+        if (!m) return;
+        for (var k in m) {
+          var e = m[k]; if (!e) continue;
+          var d = null; try { d = e.entityData; } catch (x) {}
+          if (!d) continue;
+          uN++;
+          if (uN <= 4) hp += (hp ? " " : "") + (d.isEnemy ? "E" : "H") + d.life + "/" + d.curLife;
+        }
+      });
     }
+    if (!uN) {
+      var ents = collectATBEntities();
+      uN = ents.length;
+      if (ents.length) {
+        var e0 = null; try { e0 = ents[0].node.entityData; } catch (e) {}
+        if (e0) hp = e0.curLife + "/" + e0.maxLife;
+      }
+    }
+    S.units = uN;
     return "href=" + S.href.slice(0, 90) +
            "|eng=" + S.engine + "|laya=" + S.layaVer +
            "|game=" + (S.isGame ? 1 : 0) +
@@ -974,19 +1073,26 @@
       o.push("  units=" + S.units + " speed=" + S.speedApplied + " ad=" + JSON.stringify(S.adWrapped));
       // ★ 游戏帧专属深挖
       if (S.isGame) {
-        o.push("\n--- ★★★ 判定/伤害方法源码（钩点逻辑） ---");
+        o.push("\n--- ★★★ 战斗管理器（hi）与实体地图 ---");
+        o.push(dumpBattleMgr().join("\n"));
+
+        o.push("\n--- ★★★ 判定/伤害方法源码 ---");
         o.push(dumpBattleLogic().join("\n"));
 
-        o.push("\n--- ★★ MainLevel* 逻辑实例全局定位 ---");
-        o.push(findLogicInstances().join("\n"));
-
-        o.push("\n--- ★★★ 战斗引擎类原型方法（钩点定位） ---");
-        ["MainLevelFightManager", "MainLevelEntityData", "MainLevelEntityBase", "MainLevelHeroEntity",
-         "MainLevelEnemyEntity", "ATBEntity", "DisPlayEntity", "GameSceneATB", "GameMapATB",
-         "SBattleFightEntity", "SBattleEntity", "AttrData", "AttrUtil", "EntityUtil",
-         "FightHurtData", "FightSpine", "CBuff", "CSkill", "CSkillCalc", "SkillUtil",
-         "CBattleDebug", "CBattleTest", "CBattleTestHero", "ATBBattlePlayer"].forEach(function (n) {
-          o.push("  " + protoMethods(n));
+        o.push("\n--- ★★ 判定方法源码（补充类） ---");
+        ["MainLevelEnemyEntity", "MainLevelHeroEntity", "MainLevelEntityBase"].forEach(function (n) {
+          var c = window[n];
+          if (typeof c !== "function") return;
+          var pn = [];
+          try { pn = Object.getOwnPropertyNames(c.prototype || {}).filter(function (x) { return x !== "constructor"; }); } catch (e) {}
+          o.push("  " + n + " 全部方法源码:");
+          pn.forEach(function (m) {
+            var f = null; try { f = c.prototype[m]; } catch (e) {}
+            if (typeof f !== "function") return;
+            var src = ""; try { src = f.toString(); } catch (e) { return; }
+            if (src.length < 20) return;
+            o.push("    ▸ " + n + "." + m + " (" + src.length + ") " + src.replace(/\s+/g, " ").slice(0, 700));
+          });
         });
 
         o.push("\n--- ★★ 场景类清单 ---");
@@ -994,9 +1100,6 @@
 
         o.push("\n--- ★★ fightAttrs / totalAttr 真实内容 ---");
         o.push(dumpFightAttr().join("\n"));
-
-        o.push("\n--- ATBEntity 节点全键 + 原型方法 ---");
-        o.push(dumpEntityNodeFull().join("\n"));
 
         o.push("\n--- 序列化器静态字段表 propertys ---");
         o.push(dumpPropertys().join("\n"));
